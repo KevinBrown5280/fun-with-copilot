@@ -9,7 +9,7 @@ selection, feature scoping, and bug fixes — where accuracy is more important t
 
 ## When to use this process
 
-**If the user explicitly invokes the debate process, proceed regardless of the criteria below.**
+**If the user explicitly invokes the debate process, proceed regardless of the criteria below — unless the question has a single factual answer verifiable by a quick lookup (e.g. "what is the latest version of X"), in which case confirm intent before proceeding.**
 
 Otherwise, before proactively suggesting this process, confirm **both**:
 1. The problem matches at least one criterion below

@@ -36,7 +36,7 @@ Add this to your `~/.copilot/copilot-instructions.md`:
   Invoke by telling Copilot CLI:
   > "Use the debate process to decide [your question]"
 
-  **Do not proactively suggest** this process for obvious fixes, decisions that are cheap to reverse, problems a quick test or lookup would settle, or style/naming choices. If the user explicitly asks to use it, always proceed.
+  **Do not proactively suggest** this process for obvious fixes, decisions that are cheap to reverse, problems a quick test or lookup would settle, or style/naming choices. If the user explicitly asks to use it, always proceed — except for trivially factual questions with a single verifiable answer, where you should confirm intent first.
 ```
 
 Replace `<absolute-path-to-repo>` with the local path to your clone of this repository.
