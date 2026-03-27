@@ -8,13 +8,15 @@ Use when a single model's judgment isn't enough.
 
 ## When to use
 
+If you explicitly invoke the debate, it runs unconditionally. Otherwise, before proactively suggesting it, confirm **both**: the problem matches a criterion below, AND the cost of getting it wrong justifies the overhead.
+
 - Multiple valid approaches exist and the tradeoffs are non-obvious
 - A decision will be expensive to reverse (architecture, schema, public API)
-- A previous automated fix or review produced an error you need to diagnose
+- A previous automated fix produced an error affecting functional behavior, performance, or safety — not style, naming, or minor behavioral nits
 - You need audit-quality reasoning, not just a recommendation
-- A single model gave a confident answer you want pressure-tested
+- A single model gave a confident answer you want pressure-tested, and the decision is expensive to reverse or affects correctness/safety
 
-**Don't use** for routine tasks with clear correct answers — the overhead isn't worth it.
+**Don't use for:** obvious fixes, bugs with a clear root cause, decisions that are cheap to reverse, choices that official docs answer directly, or questions a quick experiment would settle.
 
 ## How to invoke
 
@@ -33,6 +35,8 @@ Add this to your `~/.copilot/copilot-instructions.md`:
 
   Invoke by telling Copilot CLI:
   > "Use the debate process to decide [your question]"
+
+  **Do not proactively suggest** this process for obvious fixes, decisions that are cheap to reverse, problems a quick test or lookup would settle, or style/naming choices. If the user explicitly asks to use it, always proceed.
 ```
 
 Replace `<absolute-path-to-repo>` with the local path to your clone of this repository.

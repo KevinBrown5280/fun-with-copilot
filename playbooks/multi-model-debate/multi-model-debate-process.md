@@ -9,14 +9,26 @@ selection, feature scoping, and bug fixes — where accuracy is more important t
 
 ## When to use this process
 
+**If the user explicitly invokes the debate process, proceed regardless of the criteria below.**
+
+Otherwise, before proactively suggesting this process, confirm **both**:
+1. The problem matches at least one criterion below
+2. The cost of getting this decision wrong justifies the overhead — it is expensive to reverse, or affects correctness, safety, or performance at meaningful scale
+
 Use when any of these apply:
 - Multiple valid approaches exist and the tradeoffs are non-obvious
-- A previous automated fix or review produced an error or inconsistency
+- A previous automated fix or review produced an error that affects functional behavior, performance, or safety — not style, formatting, naming, or minor behavioral nits
 - A decision will be expensive to reverse (architecture, public API, schema)
 - You need audit-quality reasoning, not just a recommendation
-- A single model produced a confident answer you want pressure-tested
+- A single model produced a confident answer you want pressure-tested, and the decision is expensive to reverse or affects correctness/safety
 
-Do not use for routine tasks with clear correct answers — the overhead is not justified.
+**Do not proactively suggest for:**
+- Problems with a single clearly correct answer
+- Bugs with a clear stack trace pointing to a single root cause
+- Choosing between two approaches where official documentation recommends one
+- Questions that a quick experiment, test run, or documentation lookup would settle in minutes
+- Decisions that are cheap to reverse (feature flags, internal helpers, configuration values)
+- Style, naming, formatting, or minor behavioral nits
 
 ---
 
