@@ -176,6 +176,13 @@ output yet. **Sonnet submits its own `round-1-sonnet.md` position alongside the 
 before reading any of them** — its position counts as one of the four votes toward
 convergence thresholds.
 
+Before launching the Orchestrator, **verify all expected round files exist** (e.g., using
+`glob` or `view` on the workspace folder). Background agents may emit a completion
+notification before their file write is fully flushed to disk. If any file is missing,
+wait for the corresponding agent to finish and confirm the file is present before
+proceeding. Launching synthesis against an incomplete file set produces a false "no
+positions found" result and wastes a model call.
+
 The **Orchestrator (Sonnet)** then reads all four `round-1-<model>.md` files and writes
 `round-1-synthesis.md`:
 - Where agents agree
@@ -198,6 +205,8 @@ Each agent must:
 - Directly address the strongest argument against their position
 - Either defend their position with new evidence/reasoning, or explicitly shift
 - State what would change their mind
+
+Before writing the updated synthesis, **verify all expected round-N files exist** using `glob` or `view` on the workspace folder — the same file-existence gate as Round 1.
 
 Write updated synthesis after each round.
 
