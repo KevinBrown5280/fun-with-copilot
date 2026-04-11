@@ -1,0 +1,26 @@
+{
+  "name": "multi-model-debate",
+  "description": "Structured multi-model adversarial debate for high-confidence technical decisions. Thin orchestrator dispatches phase subagents with shared process knowledge skills.",
+  "author": {
+    "name": "Kevin"
+  },
+  "repository": "https://github.com/KevinBrown5280/fun-with-copilot",
+  "license": "MIT",
+  "keywords": [
+    "debate",
+    "adversarial",
+    "multi-model",
+    "decision-making",
+    "architecture",
+    "copilot-cli"
+  ],
+  "agents": [
+    "./agents/multi-model-debate.agent.md",
+    "./agents/debate-setup.agent.md",
+    "./agents/debate-round.agent.md",
+    "./agents/debate-synthesizer.agent.md"
+  ],
+  "skills": [
+    "./skills/"
+  ]
+}

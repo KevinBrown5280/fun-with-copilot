@@ -1,0 +1,21 @@
+{
+  "name": "fun-with-copilot",
+  "owner": {
+    "name": "KevinBrown5280"
+  },
+  "metadata": {
+    "description": "GitHub Copilot CLI plugins and playbooks from KevinBrown5280"
+  },
+  "plugins": [
+    {
+      "name": "adversarial-review",
+      "description": "Multi-model adversarial code review with 4-way voting reconciliation and cross-session dismissed-findings persistence. Supports review-only and review-and-fix modes.",
+      "source": "plugins/adversarial-review"
+    },
+    {
+      "name": "multi-model-debate",
+      "description": "Structured multi-model adversarial debate for high-confidence technical decisions. 4 models debate across rounds with synthesis, consensus detection, and implementation review.",
+      "source": "plugins/multi-model-debate"
+    }
+  ]
+}

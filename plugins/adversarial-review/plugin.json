@@ -1,0 +1,23 @@
+{
+  "name": "adversarial-review",
+  "description": "Multi-model adversarial code review with 4-way voting reconciliation and cross-session dismissed-findings persistence. Supports review-only and review-and-fix modes.",
+  "author": {
+    "name": "Kevin"
+  },
+  "repository": "https://github.com/KevinBrown5280/fun-with-copilot",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "adversarial",
+    "multi-model",
+    "security",
+    "quality",
+    "copilot-cli"
+  ],
+  "agents": [
+    "./agents/adversarial-review.agent.md"
+  ],
+  "skills": [
+    "./skills/"
+  ]
+}
