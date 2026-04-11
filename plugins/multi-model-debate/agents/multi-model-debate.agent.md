@@ -3,7 +3,7 @@ name: multi-model-debate
 description: >
   Orchestrator for structured multi-model adversarial debate.
   Dispatches phase subagents for setup, round execution, and synthesis.
-  Invoke with: copilot --agent=multi-model-debate "decide [question]"
+  Invoke with: copilot --agent=multi-model-debate --prompt "decide [question]"
 model: claude-sonnet-4.6
 disable-model-invocation: true
 ---
@@ -28,7 +28,7 @@ Track: `near_consensus_stuck` counter (initially 0), `two_two_stuck` counter (in
 For each round:
 1. Call `debate-round` via `task` (agent_type: `"multi-model-debate:debate-round"`): workspace path, round number, model assignments, artifact paths.
 2. Call `debate-synthesizer` via `task` (agent_type: `"multi-model-debate:debate-synthesizer"`): workspace path, round number, `forcing_function_fired` flag (pass current value).
-3. Read vote tally, position changes, and clustering result from synthesizer output.
+3. Read `vote_tally`, `vote_changes`, and `clusters` from synthesizer output.
 
 **After round 1 only — fragmentation note:**
 - If models voted for 3+ distinct options, note this in the synthesis. Do NOT cluster or reframe — let the models argue toward convergence naturally through subsequent rounds.

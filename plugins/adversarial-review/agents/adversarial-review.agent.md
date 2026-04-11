@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS findings (
   symbol TEXT,
   description TEXT,
   suggested_fix TEXT,
+  title TEXT,
+  evidence TEXT,
   status TEXT DEFAULT 'pending',
   cycle INTEGER,
   debate_round INTEGER DEFAULT 0,
@@ -96,17 +98,20 @@ CREATE TABLE IF NOT EXISTS cycles (
   new_findings INTEGER DEFAULT 0,
   confirmed INTEGER DEFAULT 0,
   dismissed INTEGER DEFAULT 0,
-  suppressed INTEGER DEFAULT 0
+  suppressed INTEGER DEFAULT 0,
+  debate_unresolved INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS dismissed_findings (
   id TEXT PRIMARY KEY,
   fingerprint TEXT,
+  canonical_fields TEXT,
   category TEXT,
   file TEXT,
   symbol TEXT,
   reason TEXT,
   source TEXT DEFAULT 'current_session'
+  -- F-c2-001: removed UNIQUE(fingerprint) — id is PRIMARY KEY; hash collisions handled by suppression check logic
 );
 
 CREATE TABLE IF NOT EXISTS confirmed_findings (
@@ -119,15 +124,16 @@ CREATE TABLE IF NOT EXISTS confirmed_findings (
   description TEXT,
   suggested_fix TEXT,
   fixed INTEGER DEFAULT 0,
+  fixed_at TEXT,
   source TEXT DEFAULT 'current_session'
 );
 ```
 
 ### Step 3 — Load durable state
 
-1. Read `.adversarial-review/dismissed-findings.jsonl` (if non-empty): parse each line, `INSERT INTO dismissed_findings` with `source = 'loaded_from_ledger'`.
-2. Read `.adversarial-review/confirmed-findings.jsonl` (if non-empty): parse each line, `INSERT INTO confirmed_findings` with `source = 'loaded_from_ledger'`.
-3. Read `.adversarial-review/config.json` (if present): apply `exclude_patterns` to discovery and `known_safe` to reviewer prompts.
+1. Read `.adversarial-review/dismissed-findings.jsonl` (if non-empty): parse each line. If any entry's `canonical_fields` is a JSON object (legacy format), normalize it to pipe-delimited format: `category|repo_path|scope|title|evidence` (all values normalized per fp_v1 rules). Log a warning for each normalized entry: `"Normalized legacy canonical_fields for {id}"`. Use `INSERT INTO dismissed_findings (...) VALUES (...) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint, category=excluded.category, file=excluded.file, symbol=excluded.symbol, reason=excluded.reason, source=excluded.source` with `source = 'loaded_from_ledger'`.
+2. Read `.adversarial-review/confirmed-findings.jsonl` (if non-empty): parse each line. For entries missing required fields (`description`, `suggested_fix`, `fixed`), set defaults: `description` = `'(no description recorded)'`, `suggested_fix` = `'(no fix recorded)'`, `fixed` = `0`. Log a warning for each partial entry: `"Backfilled missing fields for {id}"`. For full entries (containing metadata fields like fingerprint, category, severity, etc.), use `INSERT OR REPLACE INTO confirmed_findings` with `source = 'loaded_from_ledger'`. For sparse fix-status entries (containing only `id`, `fixed`, `fixed_at`), use `INSERT INTO confirmed_findings (id, fixed, fixed_at, source) VALUES (...) ON CONFLICT(id) DO UPDATE SET fixed=excluded.fixed, fixed_at=excluded.fixed_at` — this updates only the fix-status fields without destroying existing metadata. (Later entries with the same `id` supersede earlier ones — this handles the append-only fixed-status update pattern from §9.)
+3. Read `.adversarial-review/config.json` (if present): apply `exclude_patterns` to discovery, `known_safe` to reviewer prompts, and `max_rounds` / `subbatch_size` / `agent_timeout` to debate round constants (overriding defaults of 10 / 8 / 120 respectively).
 
 Output: `Bootstrap complete. Dismissed: N | Confirmed: M | Config: [loaded|not present] | Mode: [mode]`
 
@@ -162,8 +168,9 @@ Output: `Bootstrap complete. Dismissed: N | Confirmed: M | Config: [loaded|not p
 3. Prompt contains "full codebase" or "full review" → **full**
 4. Prompt contains "this commit" or "last commit" → **commit** (scope_ref = HEAD)
 5. Prompt contains "since `<ref>`" or "from `<ref>`" → **since+local** (extract ref from prompt)
-6. `git diff --name-only HEAD` returns files → **local**
-7. Fallback → **full**
+6. If this is a re-review cycle in review-and-fix mode (cycle > 1), force scope = **full** regardless of working tree state. (§9 step 4 requires entire-codebase re-review; without this override, fix-dirtied files cause rule 7 to select `local` instead.)
+7. `git diff --name-only HEAD` returns files → **local**
+8. Fallback → **full**
 
 > **Note:** `pr` scope is never auto-detected. It is only activated via explicit `scope: pr` in config (step 2). This avoids silently reviewing an entire branch when the user just asked for a quick review.
 
@@ -269,7 +276,7 @@ Read the `review-process` skill for: the full `fp_v1` algorithm, all normalizati
 3. Deduplicate by fingerprint (same fingerprint from multiple reviewers = same finding; merge).
 4. For each finding, tally initial votes: confirm = models that raised it, dismiss = models that didn't.
 5. **4/4 → Confirmed immediately. 0/4 → Dismissed immediately. Any other split → debate.**
-6. **For every split finding, run debate rounds in parallel** using the debate round prompt template from the `review-templates` skill. Launch all contested findings' debate agents simultaneously per round (sub-batched to ≤8 findings / ≤32 agents per wave). Wait for all agents in each sub-batch before tallying — do not stream partial results across findings. Round limit: MAX_ROUNDS=10 — force-resolve on majority vote (≥2/4 confirm) if limit is reached, with `debate_forced=true`. Stuck detection: if a finding's vote vector is identical for 3 consecutive rounds, force-resolve it rather than continuing. Agent failures: one retry per failed agent per round; if retry also fails, mark finding `debate_unresolved` and continue others. Read the `review-process` skill for the full algorithm, failure handling, SQL state management, and edge cases.
+6. **For every split finding, run debate rounds in parallel** using the debate round prompt template from the `review-templates` skill. Launch all contested findings' debate agents simultaneously per round (sub-batched to ≤8 findings / ≤32 agents per wave). Wait for all agents in each sub-batch before tallying — do not stream partial results across findings. Round limit: MAX_ROUNDS=10 — force-resolve remaining findings: ≥3/4 confirm → confirmed, ≤1/4 confirm → dismissed, 2-2 → debate_unresolved (flagged for manual review), with `debate_forced=true` for confirmed/dismissed outcomes. Stuck detection: if a finding's vote vector is identical for 3 consecutive rounds, force-resolve using the same rule. Agent failures: one retry per failed agent per round; if retry also fails, mark finding `debate_unresolved` and continue others. Read the `review-process` skill for the full algorithm, failure handling, SQL state management, and edge cases.
 7. After every finding is resolved (confirmed, dismissed, debate_forced, or suppressed), write §7/§8 ledger entries (skip `debate_unresolved` findings — they are reported in §10 only).
 
 **Do not generate the §10 report until every finding has a final status (confirmed/dismissed/suppressed/debate_forced/debate_unresolved).** Only 4/4 is auto-confirmed and only 0/4 is auto-dismissed — any other result is contested and must go through debate.
@@ -281,13 +288,12 @@ Read the `review-process` skill for: the full `fp_v1` algorithm, all normalizati
 After each dismissal decision, persist immediately (do not batch):
 
 1. Compute `fp_v1` using the normalization rules in §5.
-2. Append one JSON line to `.adversarial-review/dismissed-findings.jsonl` with fields: `id`, `fingerprint`, `fingerprint_version` ("fp_v1"), `canonical_fields` (category/repo_path/scope/title/evidence), `category`, `file`, `symbol`, `reason`, `dismissed_at` (ISO 8601), `dismissed_by_models` (array), `cycle`.
-
-3. Insert into session SQL:
+2. Insert into session SQL first (see §13 rule 6):
 ```sql
-INSERT INTO dismissed_findings (id, fingerprint, category, file, symbol, reason, source)
-VALUES ('{id}', '{fp_v1}', '{category}', '{file}', '{symbol}', '{reason}', 'current_session');
+INSERT INTO dismissed_findings (id, fingerprint, canonical_fields, category, file, symbol, reason, source)
+VALUES ('{id}', '{fp_v1}', '{canonical_fields}', '{category}', '{file}', '{symbol}', '{reason}', 'current_session');
 ```
+3. Then append one JSON line to `.adversarial-review/dismissed-findings.jsonl` with fields: `id`, `fingerprint`, `fingerprint_version` ("fp_v1"), `canonical_fields` (category/repo_path/scope/title/evidence), `category`, `file`, `symbol`, `reason`, `dismissed_at` (ISO 8601), `dismissed_by_models` (array), `cycle`. If the JSONL write fails, retry once before proceeding (§13 rule 6).
 
 ---
 
@@ -295,13 +301,12 @@ VALUES ('{id}', '{fp_v1}', '{category}', '{file}', '{symbol}', '{reason}', 'curr
 
 After each confirmation decision, persist immediately:
 
-1. Append one JSON line to `.adversarial-review/confirmed-findings.jsonl` with fields: `id`, `fingerprint`, `fingerprint_version` ("fp_v1"), `canonical_fields` (category/repo_path/scope/title/evidence), `category`, `severity`, `file`, `symbol`, `description`, `suggested_fix`, `confirmed_at` (ISO 8601), `confirmed_by_models` (array), `cycle`, `fixed` (false), `fixed_at` (null).
-
-2. Insert into session SQL:
+1. Insert into session SQL first (see §13 rule 6):
 ```sql
-INSERT INTO confirmed_findings (id, fingerprint, category, severity, file, symbol, description, suggested_fix, fixed, source)
-VALUES ('{id}', '{fp_v1}', '{category}', '{severity}', '{file}', '{symbol}', '{description}', '{suggested_fix}', 0, 'current_session');
+INSERT INTO confirmed_findings (id, fingerprint, category, severity, file, symbol, description, suggested_fix, fixed, fixed_at, source)
+VALUES ('{id}', '{fp_v1}', '{category}', '{severity}', '{file}', '{symbol}', '{description}', '{suggested_fix}', 0, NULL, 'current_session');
 ```
+2. Then append one JSON line to `.adversarial-review/confirmed-findings.jsonl` with fields: `id`, `fingerprint`, `fingerprint_version` ("fp_v1"), `canonical_fields` (category/repo_path/scope/title/evidence), `category`, `severity`, `file`, `symbol`, `description`, `suggested_fix`, `confirmed_at` (ISO 8601), `confirmed_by_models` (array), `cycle`, `fixed` (false), `fixed_at` (null). If the JSONL write fails, retry once before proceeding (§13 rule 6).
 
 ---
 
@@ -320,7 +325,7 @@ Cycle loop:
 
 1. **Run review cycle** — execute §2–§8 for this cycle number. Pass already-confirmed fingerprints to reviewer prompts alongside dismissed fingerprints so reviewers do not re-raise already-known issues.
 2. **Generate report** (§10) and output the confirmed findings summary.
-3. **Clean-cycle check** — after all debate rounds complete and every finding has a final status: if zero findings were newly confirmed this cycle (all were suppressed or dismissed), stop. Process complete. **Do not evaluate this check after blind review only — it applies after debate rounds resolve all splits.**
+3. **Clean-cycle check** — after all debate rounds complete and every finding has a final status: if zero findings were newly confirmed this cycle (all were suppressed or dismissed) AND zero findings are `debate_unresolved`, stop. Process complete. **Do not evaluate this check after blind review only — it applies after debate rounds resolve all splits.** If any findings are `debate_unresolved`, the cycle is not clean — they must be resolved (manually or via retry) before termination.
 4. **If new findings were confirmed**: increment cycle number, re-run from step 1.
 
 Kevin may stop the process at any time. Generate a partial report with current state.
@@ -335,7 +340,7 @@ Cycle loop:
 4. **Increment cycle, re-review** — run the next review cycle from scratch. All 4 models review the **entire codebase** (not just changed files).
 5. **Apply clean-cycle check:**
    - After reconciliation for the new cycle, compare its confirmed findings against all open confirmed findings (`fixed = false` in SQL).
-   - For each previously confirmed finding NOT confirmed in the new cycle: mark `fixed = true, fixed_at = <timestamp>` in `confirmed_findings` SQL and update the JSONL entry.
+   - For each previously confirmed finding NOT confirmed in the new cycle: mark `fixed = true, fixed_at = <timestamp>` in `confirmed_findings` SQL. Then append a new JSON line to `confirmed-findings.jsonl` with the same `id`, `fixed: true`, and `fixed_at: <timestamp>` (do not modify existing lines — JSONL is append-only). On next bootstrap, sparse fix-status entries use `INSERT INTO confirmed_findings (...) ON CONFLICT(id) DO UPDATE SET fixed=excluded.fixed, fixed_at=excluded.fixed_at` to update only fix-status fields without destroying existing metadata.
    - **Clean cycle**: zero confirmed findings after reconciliation AND zero remaining `confirmed_findings` with `fixed = false`.
 6. **If clean cycle**: generate final report (§10), stop.
 7. **If not clean**: repeat from step 2 with the remaining open findings.
@@ -369,7 +374,7 @@ Read the `review-templates` skill for the full severity level definitions (criti
 
 | Mode | Termination condition |
 |------|--------------------|
-| Review-only | After a clean cycle: zero new confirmed findings (all findings suppressed as already-confirmed or dismissed) |
+| Review-only | After a clean cycle: zero new confirmed findings (all findings suppressed as already-confirmed or dismissed) AND zero `debate_unresolved` findings |
 | Review-and-fix | After a clean cycle: zero confirmed findings AND all prior confirmed findings have `fixed = true` |
 | Either mode | Kevin explicitly stops — generate partial report with current state |
 
@@ -387,7 +392,7 @@ These rules govern your behavior as Orchestrator throughout the process:
 4. **Suppress with evidence.** When suppressing a prior-session finding, show the fingerprint match and original dismissal reason.
 5. **Fail loudly.** If a reviewer agent fails, log the failure. Do NOT silently proceed as a 3-model review — report the gap and ask Kevin whether to retry or proceed.
 6. **Update SQL before files.** Write to session SQL first. If JSONL write fails, retry before proceeding.
-7. **Keep IDs stable.** Finding IDs (e.g., `f-001`) are assigned at first encounter and never changed within a session.
+7. **Keep IDs stable and globally unique.** Finding IDs use the format `F-c{cycle}-{NNN}` (e.g., `F-c1-001`, `F-c2-003`). The cycle prefix ensures cross-session uniqueness in durable JSONL ledgers. IDs are assigned at first encounter and never changed within a session.
 
 ---
 

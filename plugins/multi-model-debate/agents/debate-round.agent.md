@@ -65,7 +65,7 @@ task(
 
 ### 5. Wait for completion
 
-Use `read_agent` to wait for all 4 agents to complete. Do not proceed until all have finished.
+Use `read_agent` with `wait=true` and `timeout=60` for each agent. If the agent has not completed, retry `read_agent` with `timeout=60` up to `ceiling(AGENT_TIMEOUT / 60) - 1` additional times (default AGENT_TIMEOUT=120 → 1 retry = 2 calls total, 120s effective wait). If the agent still has not completed after all retries, log a warning identifying the timed-out agent, mark its output as timed out, and proceed with the results from completed agents. Do not block indefinitely.
 
 ### 6. Verify output files (file-existence gate)
 
@@ -73,7 +73,7 @@ Use `glob` on the workspace to verify all expected files exist:
 - Regular round: `round-N-opus.md`, `round-N-codex.md`, `round-N-gpt.md`, `round-N-sonnet.md`
 - Polish round: `polish-opus.md`, `polish-codex.md`, `polish-gpt.md`, `polish-sonnet.md`
 
-If any file is missing, wait and retry — background agents may emit completion before file write flushes. Only proceed when all 4 files are confirmed present.
+If any file is missing, retry up to 10 times with a 5-second delay between attempts — background agents may emit completion before file write flushes. If a file is still absent after 10 retries, log an error identifying the missing file(s) and the agent that was responsible. Mark that agent's output as missing and report the gap to the orchestrator. Do not loop indefinitely.
 
 ### 7. Return
 

@@ -1,0 +1,2 @@
+# Adversarial review artifacts (this repo IS the plugin — don't commit self-review output)
+.adversarial-review/

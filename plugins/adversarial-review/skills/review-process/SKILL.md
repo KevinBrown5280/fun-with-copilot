@@ -29,16 +29,20 @@ Truncate the hex digest to the first **16 characters**.
 | `normalized_title` | Lowercase, punctuation collapsed (replace sequences of non-alphanumeric chars with single space), trimmed. Example: `missing input validation on workout id` |
 | `normalized_evidence` | Lowercase, all whitespace collapsed to single space, trimmed, numeric literals → `<NUM>`, string literals → `<STR>`. Max 200 characters |
 
+> **Implementation note:** The orchestrator may compute SHA-256 using any available tool — Python (`hashlib.sha256`), PowerShell (`[System.Security.Cryptography.SHA256]::Create()`), or other platform-native hashing. The algorithm is tool-agnostic; only the normalization rules and field ordering matter.
+
 ### Suppression check
 
 After computing `fp_v1` for a new finding, query `dismissed_findings`:
 ```sql
-SELECT id, reason FROM dismissed_findings WHERE fingerprint = '{fp_v1}';
+SELECT id, reason, canonical_fields FROM dismissed_findings WHERE fingerprint = '{fp_v1}'; -- F-c2-002: include canonical_fields for collision detection
 ```
 
 - **Match found — same canonical_fields:** Mark finding as `suppressed`. Do not include in voting.
 - **Match found — different canonical_fields:** Hash collision. Do NOT suppress. Flag the finding with `collision = true` and include it in normal voting.
 - **No match:** Proceed to reconciliation.
+
+**Canonical format for `canonical_fields`:** A pipe-delimited string matching the `fp_v1` input order: `category|repo_path|scope|title|evidence` (all values normalized per the `fp_v1` rules above). This deterministic format ensures equality comparison is reliable across sessions and serialization boundaries. Both the §7 dismissal ledger write and the suppression check here must use this exact format.
 
 ---
 
@@ -51,6 +55,21 @@ The reconciliation set is the **union of all non-suppressed findings** raised by
 ### Deduplication before voting
 
 Group findings by fingerprint. Findings with the same fingerprint from different reviewers are treated as the **same finding**. Merge them: use the most detailed description, combine evidence, note all raising models.
+
+### Semantic dedup (post-fingerprint)
+
+After fingerprint-based dedup, perform a secondary semantic check:
+
+1. Group remaining findings by `(file, category)`.
+2. Within each group, compare titles pairwise. If two findings target the same file, same category, and have substantially overlapping titles or descriptions (e.g., both reference the same code construct or configuration value), flag them as **candidate duplicates**.
+3. The orchestrator reviews candidate duplicates and decides whether to merge. Merging rules:
+   - Use the most detailed description from either finding.
+   - Combine evidence from both findings.
+   - Use the higher severity if they differ.
+   - Record all raising models from both findings.
+   - Keep the fingerprint and ID of the finding raised by more models (or the first-encountered if tied).
+   - Log the merge: `"Semantic merge: {id_kept} absorbed {id_dropped} (same file/category, overlapping title)"`
+4. This step is performed by the orchestrator (not automated) — it requires judgment about whether two findings are truly the same issue or distinct issues in the same file/category.
 
 ### Debate-to-consensus
 
@@ -106,8 +125,13 @@ while contested is not empty AND round <= MAX_ROUNDS:
             two_rounds_ago  = vote_vector(finding, round - 3)
             if current_vector == previous_vector == two_rounds_ago:
                 log: "Finding {id} stalled — identical vote vector for 3 consecutive rounds. Force-resolving."
-                apply majority-vote rule (see Force-resolve below)
-                mark finding debate_forced = true
+                apply majority-vote rule (see Force-resolve below — 3/4+ → confirmed, 1/4 or 0/4 → dismissed, 2/4 → debate_unresolved)
+                # F-c2-005: only set debate_forced when outcome is confirmed/dismissed, not on 2-2 ties
+                if confirm_count >= 3 or confirm_count <= 1:
+                    mark finding debate_forced = true
+                else:
+                    # 2-2 tie: set debate_unresolved only, do NOT set debate_forced
+                    UPDATE findings SET status = 'pending', debate_unresolved = 1
                 remove from contested
         if contested is empty: break
 
@@ -158,7 +182,7 @@ while contested is not empty AND round <= MAX_ROUNDS:
             elif len(votes) >= 2:
                 # 2-3 votes after retry — mark unresolved, do not tally partial results
                 log: "ERROR: Only {len(votes)}/4 votes for finding {id} round {round}. Marking debate_unresolved."
-                UPDATE findings SET status = 'dismissed', debate_unresolved = 1
+                UPDATE findings SET status = 'pending', debate_unresolved = 1  -- F-c2-004: unresolved findings stay pending, not dismissed
                 record partial votes in SQL with debate_unresolved note
                 remove from contested
                 # NOT written to §7/§8 ledgers; reported in §10
@@ -177,9 +201,19 @@ if contested is not empty:
     for finding in contested:
         latest_votes = finding.votes_by_round[round - 1]
         confirm_count = count(v for v in latest_votes if v == 'confirm')
-        resolved_status = 'confirmed' if confirm_count >= 2 else 'dismissed'
-        UPDATE findings SET status = resolved_status, debate_forced = 1
-        log: "Finding {id} force-resolved — majority {confirm_count}/4 → {resolved_status}"
+        if confirm_count >= 3:
+            resolved_status = 'confirmed'
+        elif confirm_count <= 1:
+            resolved_status = 'dismissed'
+        else:
+            # 2-2 tie — no tiebreaker; flag for manual review
+            resolved_status = 'debate_unresolved'
+        if resolved_status == 'debate_unresolved':
+            UPDATE findings SET status = 'pending', debate_unresolved = 1
+            log: "Finding {id} force-unresolved — 2-2 tie, flagged for manual review"
+        else:
+            UPDATE findings SET status = resolved_status, debate_forced = 1
+            log: "Finding {id} force-resolved — majority {confirm_count}/4 → {resolved_status}"
         move from contested to resolved
 ```
 
@@ -202,6 +236,8 @@ VALUES ('{id}', '{model}', '{confirm|dismiss}', '{one-sentence justification}', 
 ```
 
 `debate_round` = 0 for the initial blind review tally, 1+ for debate rounds.
+
+> **String escaping:** Before inserting any string value into these SQL templates, escape single quotes by doubling them (replace `'` with `''`). LLM-generated text (justifications, descriptions, suggested fixes, reasons) routinely contains apostrophes that will break single-quoted SQL literals if not escaped.
 
 ### Updating finding status
 

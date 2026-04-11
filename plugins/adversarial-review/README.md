@@ -4,12 +4,12 @@ A **GitHub Copilot CLI** plugin — a structured process for finding real bugs a
 by running 4 AI models independently against your codebase, reconciling their findings with a
 transparent voting system, and persisting dismissed findings across sessions so they never come back.
 
-Validated across 16 fix cycles on a production codebase (83 confirmed issues found, 13 dismissed).
+Currently in active development and dogfooding.
 
 ## What it does
 
 1. **4 independent reviewers** run in parallel — claude-opus (latest), gpt-codex (latest), gpt flagship (latest), and claude-sonnet (latest) each review the same scope without seeing each other's output
-2. **Debate-to-consensus** — models share reasoning and debate until unanimous (4/4 confirm = confirmed, 0/4 = dismissed); no round limit
+2. **Debate-to-consensus** — models share reasoning and debate until unanimous (4/4 confirm = confirmed, 0/4 = dismissed); hard cap of 10 rounds with force-resolve on majority vote (configurable)
 3. **Cross-session dismissal suppression** — findings you've dismissed are fingerprinted (sha256) and never re-raised in future sessions
 4. **Two review modes**: `review-only` (loop: find and report; stops when a cycle surfaces no new findings) and `review-and-fix` (loop: find, fix, re-review until all issues are resolved)
 5. **Six scope modes**: `full` codebase, `local` changes, `pr` branch diff, single `commit`, `since+local` a ref, or specific `files` — auto-detects from git state
@@ -62,7 +62,6 @@ Create `.adversarial-review/config.json` in your repo if you need overrides (the
   "primary_language": "csharp",
   "framework": "aspnet-core",
   "exclude_patterns": ["*.env", "*.pfx", "migrations/", "node_modules/"],
-  "min_severity": "low",
   "default_mode": "review-only",
   "scope": "full",
   "scope_ref": "v2.1.0",
@@ -149,7 +148,7 @@ Each model reviews independently. A model that raised a finding = implicit confi
 | Any split | Proceed to debate |
 
 **Phase 2 — Debate rounds**
-For any split, all 4 models see each other's votes and reasoning, then revise. Rounds repeat until every contested finding reaches 4/4 or 0/4. No round limit. No tiebreaker — models must actually converge.
+For any split, all 4 models see each other's votes and reasoning, then revise. Rounds repeat until every contested finding reaches 4/4 or 0/4, up to a maximum of 10 rounds (configurable via `max_rounds` in `config.json`). If a finding remains split at the round cap, it is force-resolved: 3/4 or 4/4 confirm = confirmed, 0/4 or 1/4 confirm = dismissed, 2/2 tie = unresolved (flagged for manual review as `debate_unresolved`). Force-resolved findings are marked `debate_forced: true` in the report.
 
 ## Dismissal fingerprinting
 
@@ -170,7 +169,7 @@ remove it from the ledger.
 | Challenger | gpt flagship (latest, non-codex) |
 | Orchestrator (coordinator) | claude-sonnet (latest) |
 
-No tiebreaker — findings are resolved by unanimous debate (4/4 or 0/4), not a casting vote.
+No tiebreaker for ties — a 2-2 split at the round cap is marked unresolved for manual review, not auto-resolved by a casting vote. Clear majorities (3/4 or 1/4) are force-resolved at the cap.
 
 Always uses the latest available version within each model family. The orchestrator is pinned via
 `model:` frontmatter and never auto-triggers (`disable-model-invocation: true`).

@@ -78,5 +78,7 @@ round: N
 convergence: "consensus" | "split" | "deciding_vote"
 winning_option: "X"
 vote_tally: { "Option A": N, "Option B": N, ... }
+vote_changes: [ { "model": "opus", "from": "Option A", "to": "Option B" }, ... ]   # F-c2-007: empty array if no changes
+clusters: [ { "position": "Option A", "models": ["opus", "codex"] }, ... ]          # F-c2-007: group models by current position
 status: "complete"
 ```

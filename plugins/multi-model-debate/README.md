@@ -51,20 +51,16 @@ To remove the marketplace source entirely:
 
 ## Usage
 
-**Inside an active Copilot CLI session:**
+**multi-model-debate must be invoked as a dedicated agent session** — it is an orchestrator that launches 4 independent model debaters in parallel. Asking a general Copilot session to "use the multi-model-debate agent" will not work: the orchestration pipeline won't load and only one model will run.
 
-```
-Use the multi-model-debate agent to decide [your question]
-```
-
-Or use `/agent` to browse installed agents and select it interactively.
-
-**From your terminal (starts a dedicated session):**
+**From your terminal (dedicated session):**
 
 ```
 copilot --agent=multi-model-debate                                                   # prompts for your question
 copilot --agent=multi-model-debate --prompt "Should we use Option A or Option B?"   # question inline
 ```
+
+Or use `/agent` to browse installed agents and select it interactively — this also starts a dedicated session.
 
 ## When to use
 
@@ -135,4 +131,4 @@ A completed debate produces:
 
 ## Relationship to process doc
 
-The original human-readable process document remains at `playbooks/multi-model-debate/multi-model-debate-process.md` as a standalone reference. This plugin packages the same process as an invokable Copilot CLI agent.
+The original human-readable process document remains at `playbooks/multi-model-debate/multi-model-debate-process.md` as a standalone reference. This plugin adapts that process into an invokable Copilot CLI agent with some material differences: no tiebreaker vote, no hard round cap, and different stuck-detection thresholds. Refer to each document for its specific convergence rules.
