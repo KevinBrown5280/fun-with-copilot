@@ -44,10 +44,25 @@ Use four models that bring genuinely different reasoning styles. Suggested confi
 | Orchestrator / tiebreaker | claude-sonnet (latest) | Synthesis and deciding vote if needed |
 
 **Always use the latest available version within each model family.** To identify
-latest: scan the complete available model list, sort by version number descending
-(e.g. `claude-opus-4.6 > claude-opus-4.5`; `gpt-5.3-codex > gpt-5.1-codex`), and
-pick the highest. Do not anchor on the first model whose name contains the family
+latest: scan the complete available model list, sort by version number descending,
+and pick the highest. Do not anchor on the first model whose name contains the family
 prefix.
+
+**GPT family disambiguation — critical:** The GPT family splits into two distinct
+sub-families that must NOT be mixed when selecting a role:
+- **GPT flagship (non-codex):** models whose ID contains only `gpt` and a version number,
+  with no `-codex` suffix. Use for the **Challenger** role. Compare only non-codex GPT
+  versions against each other, then pick the highest version.
+- **GPT Codex:** models with a `-codex` suffix. Use for the **Implementer (alternate)**
+  role only. Compare only codex GPT versions against each other, then pick the highest
+  version.
+
+When selecting the Challenger, filter to non-codex GPT models only, then pick the
+highest version. A codex model must never fill the Challenger slot, and a non-codex
+GPT flagship must never fill the Implementer (alternate) slot.
+
+At selection time, look at the model list available in your current context — do not
+rely on training memory or examples in this document.
 
 Any four models with meaningfully different training distributions work. The goal is
 genuine disagreement, not confirmation from four similar models.
