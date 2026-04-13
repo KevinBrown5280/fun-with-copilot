@@ -17,9 +17,13 @@ Currently in active development and dogfooding.
 
 ## Install
 
-From inside the Copilot CLI:
+Add the marketplace source:
 ```
 /plugin marketplace add KevinBrown5280/fun-with-copilot
+```
+
+Install the plugin:
+```
 /plugin install adversarial-review@fun-with-copilot
 ```
 

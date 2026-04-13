@@ -13,9 +13,13 @@ A structured process for reaching high-confidence technical decisions using 4 AI
 
 ## Install
 
-From inside the Copilot CLI:
+Add the marketplace source:
 ```
 /plugin marketplace add KevinBrown5280/fun-with-copilot
+```
+
+Install the plugin:
+```
 /plugin install multi-model-debate@fun-with-copilot
 ```
 
