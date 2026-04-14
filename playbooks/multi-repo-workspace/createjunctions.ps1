@@ -40,6 +40,7 @@ if ($duplicates) {
     exit 1
 }
 
+$hadErrors = $false
 foreach ($entry in $Projects) {
     $junctionName = Split-Path $entry -Leaf
     $junctionPath = Join-Path $WorkspaceRoot $junctionName
@@ -52,6 +53,7 @@ foreach ($entry in $Projects) {
         } else {
             Write-Warning "Target does not exist, skipping: $targetPath"
         }
+        $hadErrors = $true
         continue
     }
 
@@ -63,10 +65,18 @@ foreach ($entry in $Projects) {
         } else {
             $actualDesc = if ($existing.LinkType -eq 'Junction') { $existingTarget } else { "(not a junction)" }
             Write-Warning "Path exists but is not the expected junction: $junctionPath`n  Expected target: $targetPath`n  Actual:          $actualDesc"
+            $hadErrors = $true
         }
         continue
     }
 
-    New-Item -ItemType Junction -Path $junctionPath -Target $targetPath | Out-Null
-    Write-Host "Created: $junctionPath -> $targetPath" -ForegroundColor Green
+    try {
+        New-Item -ItemType Junction -Path $junctionPath -Target $targetPath -ErrorAction Stop | Out-Null
+        Write-Host "Created: $junctionPath -> $targetPath" -ForegroundColor Green
+    } catch {
+        Write-Error "ERROR creating junction $junctionPath -> $targetPath : $_"
+        $hadErrors = $true
+    }
 }
+
+if ($hadErrors) { exit 1 }

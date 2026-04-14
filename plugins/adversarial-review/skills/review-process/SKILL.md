@@ -27,15 +27,25 @@ Truncate the hex digest to the first **16 characters**.
 | `normalized_repo_path` | Repo-relative path, lowercase, forward-slash normalized. Example: `src/api/controllers/workoutcontroller.cs` |
 | `normalized_scope` | Symbol/function/class name if known, lowercase. If no symbol applies, use `"<file>"`. Example: `getworkoutplan` |
 | `normalized_title` | Lowercase, punctuation collapsed (replace sequences of non-alphanumeric chars with single space), trimmed. Example: `missing input validation on workout id` |
-| `normalized_evidence` | Lowercase, all whitespace collapsed to single space, trimmed, numeric literals → `<NUM>`, string literals → `<STR>`. Max 200 characters |
+| `normalized_evidence` | Lowercase, all whitespace collapsed to single space, trimmed, numeric literals → `<NUM>`, string literals → `<STR>`. Apply all substitutions first, then truncate to the **last 200 characters** of the result (tail truncation — preserves the most specific evidence). *(F-c9-015)* |
 
-> **Implementation note:** The orchestrator may compute SHA-256 using any available tool — Python (`hashlib.sha256`), PowerShell (`[System.Security.Cryptography.SHA256]::Create()`), or other platform-native hashing. The algorithm is tool-agnostic; only the normalization rules and field ordering matter.
+> **Implementation note — prefer PowerShell (no extra dependencies):**
+> ```powershell
+> $sha = [System.Security.Cryptography.SHA256]::Create()
+> $bytes = [System.Text.Encoding]::UTF8.GetBytes($input_string)
+> $fp_v1 = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-','').ToLower().Substring(0,16)
+> ```
+> Python (`hashlib.sha256`) or any other platform tool producing identical hex output is also acceptable. The algorithm is tool-agnostic; only the normalization rules and field ordering matter.
 
 ### Suppression check
 
+> **NOTE:** All vote and finding tracking is in-memory only — do NOT create SQL tables.  
+> State is rebuilt from JSONL files on each bootstrap. The pseudocode below uses  
+> Python-style dict/list notation to describe in-memory operations only. *(F-c1-010)*
+
 After computing `fp_v1` for a new finding, query `dismissed_findings`:
-```sql
-SELECT id, reason, canonical_fields FROM dismissed_findings WHERE fingerprint = '{fp_v1}'; -- F-c2-002: include canonical_fields for collision detection
+```python
+fp_v1 in dismissed_fps  # check if fingerprint is in the in-memory dismissed_fps set  # F-c1-010, F-c2-003
 ```
 
 - **Match found — same canonical_fields:** Mark finding as `suppressed`. Do not include in voting.
@@ -47,6 +57,13 @@ SELECT id, reason, canonical_fields FROM dismissed_findings WHERE fingerprint = 
 ---
 
 ## Reconciliation Rules
+
+**Reviewer output validation (before reconciliation):** *(F-c9-009)*
+After all 4 reviewer agents complete, for each reviewer:
+1. Count the number of JSON objects successfully parsed from the output (valid finding lines with required fields).
+2. Extract the `REVIEW_COMPLETE: N` count from the end of the output.
+3. If `parsed_count < declared_count`: log `"WARN: Reviewer {model} declared {declared_count} findings but only {parsed_count} were parseable ({declared_count - parsed_count} malformed/missing lines)."`
+4. If `parsed_count == 0` AND `declared_count > 0`: log `"ERROR: Reviewer {model} returned 0 parseable findings vs declared {declared_count} — output may be entirely malformed."` and attempt one retry of that reviewer agent. If retry also yields 0 parseable findings, proceed with 0 for that reviewer and flag in the §10 report.
 
 The reconciliation set is the **union of all non-suppressed findings** raised by any of the 4 reviewers.
 
@@ -91,7 +108,7 @@ dismiss_count = 4 - confirm_count
 - 0/4 confirm → **Dismissed** (skip debate)
 - Any other result → **proceed to debate** (this includes 1/4, 2/4, and 3/4 — only unanimous agreement in either direction skips debate)
 
-**Debate rounds — parallel batching algorithm**
+**Debate rounds — parallel algorithm**
 
 After initial tally, partition findings:
 
@@ -106,8 +123,7 @@ If `contested` is empty, skip to §7/§8 ledger writes.
 
 ```
 MAX_ROUNDS      = 10    # hard cap; force-resolves remaining findings
-SUBBATCH_SIZE   = 8     # max findings per sub-batch → 8 × 4 = 32 debate agents per wave
-AGENT_TIMEOUT   = 120   # seconds to wait per agent before treating as failed
+AGENT_TIMEOUT   = 600   # seconds to wait per agent before treating as failed  # F-c2-001
 ```
 
 **Round loop:**
@@ -126,72 +142,79 @@ while contested is not empty AND round <= MAX_ROUNDS:
             if current_vector == previous_vector == two_rounds_ago:
                 log: "Finding {id} stalled — identical vote vector for 3 consecutive rounds. Force-resolving."
                 apply majority-vote rule (see Force-resolve below — 3/4+ → confirmed, 1/4 or 0/4 → dismissed, 2/4 → debate_unresolved)
+                confirm_count = count(v for v in current_vector if v == 'confirm')
                 # F-c2-005: only set debate_forced when outcome is confirmed/dismissed, not on 2-2 ties
                 if confirm_count >= 3 or confirm_count <= 1:
-                    mark finding debate_forced = true
+                    findings[id]["status"] = "confirmed" if confirm_count >= 3 else "dismissed"  # F-c6-004
+                    findings[id]["debate_forced"] = True  # F-c2-005
                 else:
                     # 2-2 tie: set debate_unresolved only, do NOT set debate_forced
-                    UPDATE findings SET status = 'pending', debate_unresolved = 1
+                    findings[id]["status"] = "pending"  # F-c1-010
+                    findings[id]["debate_unresolved"] = True  # F-c1-010
                 remove from contested
         if contested is empty: break
 
-    # --- Sub-batch partitioning ---
-    subbatches = chunk(contested, SUBBATCH_SIZE)
+    # F-c1-011: launch one agent per role (4 total), each receives ALL contested findings
+    # Every agent receives the frozen input snapshot:
+    #   all contested finding details + all votes and reasoning from prior rounds
+    # Use the debate round prompt template from the review-templates skill
+    # agent_type: "code-review", mode: "background"
+    # model: assigned model for each of the 4 roles
+    # CRITICAL: set model: explicitly on each task call
+    Launch exactly 4 task agents in parallel (one per model role)
 
-    for subbatch in subbatches:
+    # Wait for ALL 4 agents for this round before tallying any finding
+    Wait (blocking) for all 4 agents; timeout each at AGENT_TIMEOUT seconds
 
-        # Launch 4 × len(subbatch) debate agents in parallel
-        # Every agent receives the frozen input snapshot:
-        #   finding details + all votes and reasoning from prior rounds
-        # Use the debate round prompt template from the review-templates skill
-        # agent_type: "code-review", mode: "background"
-        # model: assigned model for each of the 4 roles
-        # CRITICAL: set model: explicitly on each task call
-        Launch 4 × len(subbatch) task agents in parallel
-
-        # Wait for ALL agents in this sub-batch before tallying any finding
-        Wait (blocking) for all agents in sub-batch; timeout each at AGENT_TIMEOUT seconds
-
-        for finding in subbatch:
-            votes = collect_votes(finding, this_round_agents)
-
-            # --- Failure handling ---
-            if len(votes) < 4:
-                failed_count = 4 - len(votes)
-                log: "WARN: {failed_count} agent(s) failed/timed-out for finding {id} round {round}"
-
-                # Retry each failed agent once
-                for each failed_agent:
-                    retry_result = retry_agent(failed_agent, timeout=AGENT_TIMEOUT)
-                    if retry_result.ok:
-                        votes.add(retry_result.vote)
-                    else:
-                        log: "ERROR: Agent {model} failed retry for finding {id} round {round}"
-
-            if len(votes) == 4:
-                confirm_count = count(v for v in votes if v == 'confirm')
-                INSERT INTO votes (finding_id, model, vote, justification, cycle, debate_round) ...
-                if confirm_count == 4:
-                    UPDATE findings SET status = 'confirmed'
-                    move from contested to resolved
-                elif confirm_count == 0:
-                    UPDATE findings SET status = 'dismissed'
-                    move from contested to resolved
-                # else: still split — remains in contested for round+1
-
-            elif len(votes) >= 2:
-                # 2-3 votes after retry — mark unresolved, do not tally partial results
-                log: "ERROR: Only {len(votes)}/4 votes for finding {id} round {round}. Marking debate_unresolved."
-                UPDATE findings SET status = 'pending', debate_unresolved = 1  -- F-c2-004: unresolved findings stay pending, not dismissed
-                record partial votes in SQL with debate_unresolved note
-                remove from contested
-                # NOT written to §7/§8 ledgers; reported in §10
-
+    # --- Failure handling (round-level — before per-finding tally) ---  *(F-c8-001)*
+    # Agents serve ALL findings per round, so retries are round-scoped, not per-finding.
+    # Retrying inside the per-finding loop would relaunch the same failed agent once per
+    # contested finding (N relaunches for N findings) instead of once per round.
+    failed_agents = [a for a in this_round_agents if not a.succeeded]
+    if failed_agents:
+        log: "WARN: {len(failed_agents)} agent(s) failed/timed-out in round {round}"
+        for each failed_agent:
+            retry_result = retry_agent(failed_agent, timeout=AGENT_TIMEOUT)
+            if retry_result.ok:
+                replace failed_agent with retry_result in this_round_agents
             else:
-                # 0-1 votes — catastrophic failure
-                log: "ERROR: <2 votes for finding {id} round {round}. Marking debate_unresolved."
-                UPDATE findings SET debate_unresolved = 1
-                remove from contested
+                log: "ERROR: Agent {model} failed retry in round {round}"
+
+    for finding in contested:
+        # round_votes: list of {model, vote, reasoning} dicts returned by this round's agents
+        # Distinct from the global `votes` dict-of-lists ledger (keyed by finding_id)
+        round_votes = collect_votes(finding, this_round_agents)  # F-c3-001
+
+        if len(round_votes) == 4:
+            confirm_count = count(v for v in round_votes if v["vote"] == 'confirm')
+            for v in round_votes:  # F-c3-001: append each collected vote to the global ledger
+                votes[finding_id].append({"model": v["model"], "round": round, "vote": v["vote"], "reasoning": v["reasoning"]})
+            if confirm_count == 4:
+                findings[id]["status"] = "confirmed"  # F-c1-010
+                move from contested to resolved
+            elif confirm_count == 0:
+                findings[id]["status"] = "dismissed"  # F-c1-010
+                move from contested to resolved
+            # else: still split — remains in contested for round+1
+
+        elif len(round_votes) >= 2:
+            # 2-3 votes after retry — mark unresolved, do not tally partial results
+            log: "ERROR: Only {len(round_votes)}/4 votes for finding {id} round {round}. Marking debate_unresolved."
+            findings[id]["status"] = "pending"  # F-c2-004, F-c1-010
+            findings[id]["debate_unresolved"] = True  # F-c1-010
+            for v in round_votes:  # F-c3-001
+                votes[finding_id].append({"model": v["model"], "round": round, "vote": v["vote"], "reasoning": v["reasoning"], "debate_unresolved": True})
+            remove from contested
+            # NOT written to §7/§8 ledgers; reported in §10
+
+        else:
+            # 0-1 votes — catastrophic failure
+            log: "ERROR: <2 votes for finding {id} round {round}. Marking debate_unresolved."
+            findings[id]["status"] = "pending"  # F-c2-004, F-c1-010, F-c9-005
+            findings[id]["debate_unresolved"] = True  # F-c1-010
+            for v in round_votes:  # F-c9-006: record any received votes to preserve audit trail
+                votes[finding_id].append({"model": v["model"], "round": round, "vote": v["vote"], "reasoning": v["reasoning"], "debate_unresolved": True})
+            remove from contested
 
     round += 1
 
@@ -209,43 +232,44 @@ if contested is not empty:
             # 2-2 tie — no tiebreaker; flag for manual review
             resolved_status = 'debate_unresolved'
         if resolved_status == 'debate_unresolved':
-            UPDATE findings SET status = 'pending', debate_unresolved = 1
+            findings[id]["status"] = "pending"  # F-c1-010
+            findings[id]["debate_unresolved"] = True  # F-c1-010
             log: "Finding {id} force-unresolved — 2-2 tie, flagged for manual review"
         else:
-            UPDATE findings SET status = resolved_status, debate_forced = 1
+            findings[id]["status"] = resolved_status
+            findings[id]["debate_forced"] = True
             log: "Finding {id} force-resolved — majority {confirm_count}/4 → {resolved_status}"
         move from contested to resolved
 ```
 
-**Wait rationale:** All agents within a sub-batch must complete before any finding in that sub-batch is tallied. This guarantees round-`r` votes are written only after all round-`r` agents return — preserving a consistent input snapshot for round-`r+1`.
+**Wait rationale:** All 4 agents must complete before any finding is tallied. This guarantees round-`r` votes are written only after all round-`r` agents return — preserving a consistent input snapshot for round-`r+1`.
 
 **Stuck detection rationale:** If a finding has the same vote vector for 3 consecutive rounds, no new reasoning is entering the debate. Force-resolve applies the same majority-vote rule as the MAX_ROUNDS cap.
 
 **`debate_unresolved` findings:** Agent failures prevented a valid 4/4 tally. NOT written to §7/§8 ledgers. Appear in §10 with partial vote history and `debate_unresolved: true`. Kevin can manually review and reclassify.
 
-**`debate_forced` findings:** Hit MAX_ROUNDS or stuck-detection threshold. Written to the appropriate ledger (confirmed or dismissed) per majority-vote, with `debate_forced: true` in SQL. Surfaced as a dedicated subsection in §10.
+**`debate_forced` findings:** Hit MAX_ROUNDS or stuck-detection threshold. Written to the appropriate ledger (confirmed or dismissed) per majority-vote, with `debate_forced: true` in the findings JSONL (`cycle-{N}-findings.jsonl`). Surfaced as a dedicated subsection in §10.
 
 After the loop, every finding has a terminal status: confirmed, dismissed, debate_unresolved, or debate_forced. Proceed to §7/§8 ledger writes (skipping debate_unresolved findings).
 
 ### Recording votes
 
 For every finding, insert one row per model:
-```sql
-INSERT INTO votes (finding_id, model, vote, justification, cycle, debate_round)
-VALUES ('{id}', '{model}', '{confirm|dismiss}', '{one-sentence justification}', {cycle}, {debate_round});
+```python
+votes[finding_id].append({"model": model, "round": debate_round, "vote": vote, "reasoning": justification})  # F-c1-010
 ```
 
 `debate_round` = 0 for the initial blind review tally, 1+ for debate rounds.
 
-> **String escaping:** Before inserting any string value into these SQL templates, escape single quotes by doubling them (replace `'` with `''`). LLM-generated text (justifications, descriptions, suggested fixes, reasons) routinely contains apostrophes that will break single-quoted SQL literals if not escaped.
+> **In-memory state note:** No SQL escaping is required for the in-memory structures above; preserve raw strings exactly and serialize safely when writing JSONL.
 
 ### Updating finding status
 
-```sql
-UPDATE findings SET status = 'confirmed' WHERE id = '{id}';
--- Possible statuses: 'confirmed', 'dismissed', 'suppressed', 'pending'
--- Additional flags (set independently): debate_forced = 1, debate_unresolved = 1
--- debate_round tracks the round number where the finding was resolved (0 = initial tally)
+```python
+findings[id]["status"] = "confirmed"  # F-c1-010
+# Possible statuses: "confirmed", "dismissed", "suppressed", "pending"
+# Additional flags (set independently): debate_forced = True, debate_unresolved = True
+# debate_round tracks the round number where the finding was resolved (0 = initial tally)
 ```
 
 ---

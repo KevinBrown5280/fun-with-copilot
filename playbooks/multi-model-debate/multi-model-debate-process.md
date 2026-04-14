@@ -414,7 +414,7 @@ Challenge the weaknesses of each option you do not recommend.
 
 ```
 You are [model-name], acting as [role: Implementer / Challenger / Orchestrator] in
-Round [R] of a [M]-model adversarial debate.
+Round [N] of a [M]-model adversarial debate.
 
 ## Required reading (do this first)
 - [debate workspace]/context.md

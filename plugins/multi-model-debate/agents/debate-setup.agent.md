@@ -46,6 +46,8 @@ Create `<workspace>/context.md` containing:
 - **Workspace path** — absolute path recorded for all agents
 - **Final validation round** — note that a polish/validation round follows consensus
 
+Resolve `max_rounds` for the debate: read `.multi-model-debate/config.json` if present, use `max_rounds` when set to an integer in the valid range 1–50, otherwise default to 10. Record the resolved `max_rounds` value for return to the orchestrator.
+
 ### 4. Verification gate
 
 Read the `debate-rules` skill for verification gate rules.

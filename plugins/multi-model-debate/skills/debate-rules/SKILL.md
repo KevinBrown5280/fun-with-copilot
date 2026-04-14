@@ -130,7 +130,7 @@ An agent that changes position must:
 
 ### No implementation until consensus
 The implementer (Opus or Codex) does not touch production files until:
-- Consensus is reached (3-of-4 minimum, with dissenter window completed)
+- Consensus is reached (4-of-4 immediately, or 3-of-4 validated near-consensus after rebuttal + 2 stuck rounds — see §5 Convergence Criteria)
 - The polish round has validated the exact output (code, config, documentation)
 
 ### No commit until human review
@@ -151,7 +151,7 @@ A model's **position** is its **vote** (which option it supports), not the argum
 ### Consensus rules
 
 - **4-of-4 agreement** = consensus immediately at any round; proceed to polish round
-- **3-of-4 agreement** = "near-consensus" — the dissenter continues debating with no round cap:
+- **3-of-4 agreement** = "near-consensus" — the dissenter continues debating under the normal convergence and auto-exit rules:
   - Before 3/4 is confirmed, the **majority must explicitly rebut the dissenter's single strongest objection** in their round file. A 3/4 that never addresses the dissenter's best argument is not valid.
   - If any round reaches 4/4 → consensus immediately
   - If any round drops back to a split → near-consensus is cancelled; debate continues normally
@@ -159,11 +159,11 @@ A model's **position** is its **vote** (which option it supports), not the argum
 - **3/4 is never valid before round 2** — the dissenting position must be heard before it can be overruled; run round 2 regardless
 - **Any other split** = run another debate round
 
-There is no round cap. Debate continues until 3-of-4 or better.
+The orchestrator enforces a hard round cap (default `max_rounds=10`, configurable via config). Debate runs until 3-of-4 or better, subject to the auto-exit conditions below, but the hard cap triggers force-resolve if consensus has not been reached by round `max_rounds`.
 
 ### Long-running debates
 
-After round 6 without consensus, the orchestrator must surface a check-in: report the current vote tally, the core unresolved disagreement, and ask Kevin whether to continue or terminate. This is not a hard stop — Kevin can say continue and the debate proceeds. If Kevin is unavailable, continue automatically.
+After round 6 without consensus, the orchestrator must surface a check-in: report the current vote tally, the core unresolved disagreement, and ask the user whether to continue or terminate. This is not a hard stop — the user can say continue and the debate proceeds. If the user is unavailable, continue automatically.
 
 ### Stuck detection
 
@@ -171,16 +171,27 @@ After round 6 without consensus, the orchestrator must surface a check-in: repor
 - Identify the single sharpest disagreement between camps. Pose a concrete scenario or test case that would produce different outcomes under each position.
 - If still stuck the next round: demand each camp explicitly state what evidence or argument would change their mind. If neither camp can name anything falsifiable, reframe the question — it may be a values disagreement rather than a factual one, and reframing often unlocks movement.
 
-**2/2 automatic exit** — if the vote is 2-2 and no model has changed its vote for **5 consecutive rounds**, the debate cannot converge through argument alone. Write `split-positions.md` automatically (do not wait for Kevin). Each side's strongest case is documented; Kevin decides.
+**2/2 automatic exit** — if the vote is 2-2 and no model has changed its vote for **5 consecutive rounds**, the debate cannot converge through argument alone. Write `split-positions.md` automatically (do not wait for the user). Each side's strongest case is documented; the user decides.
 
 **Non-2/2 stagnation exit** — for any other stuck configuration (e.g., 2/1/1 with 3 distinct options, or a split oscillating below 3-of-4 and never stabilizing), if no model changes its vote for **5 consecutive rounds**, the synthesizer must run a **forcing function round**: each camp must explicitly state what concrete evidence or test would falsify their position. A camp that cannot name a falsifiable criterion is flagged as holding a non-empirical position. If the vote still does not move in the round following the forcing function, write `split-positions.md` automatically. Note: this does not apply to near-consensus (3/4) — that path has its own confirmation rules above.
 
-For splits other than 2-2 that are still moving (any model changed vote in the last round), debate continues with no cap.
+For splits other than 2-2 that are still moving (any model changed vote in the last round), debate continues subject to the orchestrator hard cap (`max_rounds`).
 
-**When consensus is reached**, the Synthesizer (debate-synthesizer agent) writes `consensus.md` immediately after
-the final synthesis. It captures the agreed decision, the key rationale, and any
-dissenting concerns that were raised and addressed. This file is required reading for the
-polish round.
+**When 4/4 unanimous consensus is reached**, the Synthesizer (debate-synthesizer agent) writes `consensus.md` immediately after the final synthesis. **When confirmed near-consensus (3/4) is reached**, the orchestrator writes `consensus.md` as part of Step 3. In both cases, `consensus.md` captures the agreed decision, the key rationale, and any dissenting concerns that were raised and addressed. This file is required reading for the polish round.
+
+## 5.1 Degraded-Round Convergence Paths
+
+### Degraded rounds
+
+A **degraded round** occurs when one or more debaters time out or produce no output. The orchestrator passes `degraded=true` and `present_count=(4 - missing_count)` to the synthesizer.
+
+**Key rules:**
+- **All present agents agree** (`present_count`-of-`present_count`) in a degraded round → **near-consensus only**, NOT immediate consensus. One additional clean non-degraded round is required to confirm. The `degraded_unanimous_pending` flag is set while awaiting that confirmation round.
+- **`(present_count-1)`-of-`present_count` agree with a present dissenter (`present_count >= 3`)** → degraded near-consensus: apply the same rebuttal-check and `near_consensus_stuck` logic as the normal 3/4 path.
+- **Any other split among present agents** → apply normal split rules scaled to `present_count`.
+- **All 4 debaters absent** → do not invoke the synthesizer; report total failure to the user.
+
+The `degraded_unanimous_pending` flag resets when: (a) the confirmation non-degraded round runs, or (b) the vote drops back below near-consensus. Full implementation details are in the orchestrator agent spec (Step 2, items 6 and 10).
 
 ---
 
@@ -250,7 +261,7 @@ preferred over blocking the debate entirely.
   code does, what the empirical behavior is)
 - **Round 3** typically surfaces the real value tradeoff (minimality vs. safety,
   consistency vs. flexibility)
-- **Round 4+** — not unusual under the new rules; if you reach it, either a dissenter is still holding out or the debate dropped back from near-consensus. Check whether any model changed position in the last round; if not, the debate is stuck — apply stuck detection (3/4 or better → consensus; 2-2 → surface to user). If models are still shifting, keep going — the deciding factor is usually a criterion that wasn't made explicit until that round (add it to context.md for future runs)
+- **Round 4+** — not unusual under the new rules; if you reach it, either a dissenter is still holding out or the debate dropped back from near-consensus. Check whether any model changed position in the last round; if not, the debate is stuck — apply stuck detection per §5 rules: 3/4 uses the `near_consensus_stuck` counter; 2-2 uses the `two_two_stuck` counter (auto-exit at 5 consecutive stuck rounds — the debate does not immediately surface to the user). If models are still shifting, keep going — the deciding factor is usually a criterion that wasn't made explicit until that round (add it to context.md for future runs)
 - Models converge faster when the evidence is unambiguous; empirical tests (running the
   actual code and reporting output) are more powerful than theoretical arguments
 - A model that has shifted once is more likely to shift again — evaluate the *evidence*

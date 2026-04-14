@@ -9,10 +9,10 @@ Currently in active development and dogfooding.
 ## What it does
 
 1. **4 independent reviewers** run in parallel — claude-opus (latest), gpt-codex (latest), gpt flagship (latest), and claude-sonnet (latest) each review the same scope without seeing each other's output
-2. **Debate-to-consensus** — models share reasoning and debate until unanimous (4/4 confirm = confirmed, 0/4 = dismissed); hard cap of 10 rounds with force-resolve on majority vote (configurable)
+2. **Debate-to-consensus** — models share reasoning and debate until unanimous (all completing reviewers confirm = confirmed; none confirm = dismissed); hard cap of 10 rounds with force-resolve on majority vote (configurable)
 3. **Cross-session dismissal suppression** — findings you've dismissed are fingerprinted (sha256) and never re-raised in future sessions
 4. **Two review modes**: `review-only` (loop: find and report; stops when a cycle surfaces no new findings) and `review-and-fix` (loop: find, fix, re-review until all issues are resolved)
-5. **Six scope modes**: `full` codebase, `local` changes, `pr` branch diff, single `commit`, `since+local` a ref, or specific `files` — auto-detects from git state
+5. **Four scope modes**: `full` codebase, `local` changes, `since+local` from a ref, or specific `files` — auto-detects from git state
 6. **Durable audit trail** — JSONL ledgers + per-cycle markdown reports in `.adversarial-review/`
 
 ## Install
@@ -76,44 +76,45 @@ Create `.adversarial-review/config.json` in your repo if you need overrides (the
 }
 ```
 
-`scope` auto-detects by default: uncommitted changes → `local`; else → `full`. Use `scope: pr` in config to explicitly review branch changes.
+`scope` auto-detects by default: uncommitted changes → `local`; else → `full`.
 
 ## Usage
 
 **adversarial-review must be invoked as a dedicated agent session** — it is a top-level orchestrator that launches 4 independent reviewer models in parallel. Asking a general Copilot session to "use the adversarial-review agent" will not work: the orchestration pipeline won't load and only one model will run.
 
-**From your terminal (dedicated session):**
+Use `/agent` to browse installed agents and select `adversarial-review`. This starts a dedicated session with the full orchestration pipeline loaded.
+
+Or launch directly from your terminal:
 
 ```
-copilot --agent=adversarial-review                            # auto-detects scope and asks for mode
-copilot --agent=adversarial-review --prompt "review-only"    # accumulates findings across cycles until nothing new surfaces
-copilot --agent=adversarial-review --prompt "review-and-fix" # find, fix, re-review until clean
-copilot --agent=adversarial-review --prompt "review-only, full codebase"
-copilot --agent=adversarial-review --prompt "review-only, since v2.1.0"
-copilot --agent=adversarial-review --prompt "review-only, this commit"
-copilot --agent=adversarial-review --prompt "review-only, src/auth/TokenService.cs"
+copilot --agent=adversarial-review:adversarial-review
 ```
 
-Or use `/agent` to browse installed agents and select it interactively — this also starts a dedicated session.
-
-**From within an active Copilot CLI session** (via the `powershell` tool):
+Once in the dedicated session, type your mode and optional scope to begin:
 
 ```
-Use the powershell tool to run: copilot --agent=adversarial-review --prompt "review-only"
+review-only                               # report findings only; loops until a cycle surfaces nothing new
+review-and-fix                            # find, fix, re-review until clean
 ```
 
-This subprocesses the agent through the validated terminal path, loading the full orchestration pipeline. Do **not** ask the current session to "use the adversarial-review agent" directly — that will not load the pipeline and will run only a single model.
+Both modes accept any scope after a comma:
+
+```
+review-only, local changes                # staged + unstaged (auto-detected when uncommitted changes exist)
+review-and-fix, full codebase             # review and fix the entire codebase
+review-only, src/auth/TokenService.cs     # target specific files
+```
+
+Leave the prompt empty and the agent auto-detects scope and asks for mode.
 
 **Scope modes:**
 
 | Mode | What is reviewed | How to trigger |
 |------|-----------------|----------------|
-| `full` | Entire codebase | "full codebase" or config `scope: "full"` |
 | `local` | Staged + unstaged changes | auto-detected when uncommitted changes exist |
-| `pr` | This branch vs remote default | config `scope: "pr"` (explicit only — never auto-detected) |
-| `commit` | One specific commit | "this commit" or "last commit" or config `scope: "commit"` + `scope_ref` |
-| `since+local` | All changes from ref to working tree | "since v2.1.0" / "from main" or config `scope: "since+local"` + `scope_ref` |
+| `full` | Entire codebase | "full codebase" or config `scope: "full"` |
 | `files` | Specific files or globs | mention file paths in prompt or config `scope_files` |
+| `since+local` | All changes from a ref to working tree | "since v2.1.0" / "since a3f9c12" or config `scope: "since+local"` + `scope_ref` (accepts tags, branches, or commit SHAs) |
 
 ## What you get
 
@@ -147,18 +148,18 @@ Each model reviews independently. A model that raised a finding = implicit confi
 
 | Initial tally | Decision |
 |--------------|----------|
-| 4/4 confirm | Confirmed immediately ✓ |
-| 0/4 confirm | Dismissed immediately ✗ |
+| All completing reviewers confirm | Confirmed immediately ✓ |
+| No completing reviewers confirm | Dismissed immediately ✗ |
 | Any split | Proceed to debate |
 
 **Phase 2 — Debate rounds**
-For any split, all 4 models see each other's votes and reasoning, then revise. Rounds repeat until every contested finding reaches 4/4 or 0/4, up to a maximum of 10 rounds (configurable via `max_rounds` in `config.json`). If a finding remains split at the round cap, it is force-resolved: 3/4 or 4/4 confirm = confirmed, 0/4 or 1/4 confirm = dismissed, 2/2 tie = unresolved (flagged for manual review as `debate_unresolved`). Force-resolved findings are marked `debate_forced: true` in the report.
+For any split, all 4 models see each other's votes and reasoning, then revise. Rounds repeat until every contested finding reaches 4/4 or 0/4, up to a maximum of 10 rounds (configurable via `max_rounds` in `config.json`). If a finding remains split at the round cap, it is force-resolved: 3/4 or 4/4 confirm = confirmed, 0/4 or 1/4 confirm = dismissed, 2-2 tie = unresolved (flagged for manual review as `debate_unresolved`). Force-resolved findings are marked `debate_forced: true` in the report.
 
 ## Dismissal fingerprinting
 
 Each dismissed finding gets a deterministic fingerprint:
 ```
-fp_v1 = sha256(category | repo_path | scope | title | evidence)[:16]
+fp_v1 = sha256(category | repo_path | symbol | title | evidence)[:16]
 ```
 This fingerprint is stored in `dismissed-findings.jsonl`. In future sessions, any finding matching
 a stored fingerprint is suppressed before voting — it never surfaces again unless you manually
