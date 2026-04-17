@@ -101,12 +101,38 @@ artifacts themselves. This:
 - Prevents the orchestrator from inadvertently filtering what agents see
 
 ### Ground technical claims in live documentation
+
 Training data goes stale. For decisions involving library versions, API surface, or
 service capabilities, agents must **verify** claims against live documentation rather
 than relying on training data alone — and cite the source used. If live documentation
 cannot be retrieved, flag the claim as training-data-only and apply the four fallback
 rules in the Verification Gate section (retry, isolated section, conditional options, post-decision
 verification).
+
+**When live research is mandatory (not optional):** If a debater is making **any claim** in a round that involves the following, they must use `web_fetch` (or an equivalent live retrieval tool) and record findings in a structured `## Live Research Log` table:
+- Package/library version numbers
+- GA / Preview / deprecated / EOS status for a runtime, service, or SDK
+- EOS / support lifecycle dates
+- Pricing (any service tier, meter rate, or cost estimate)
+- API surface changes or breaking changes since a stated date
+
+**Required format — Live Research Log table** (must appear at the top of the round file):
+
+```
+## Live Research Log
+| Source URL | Finding | Date Retrieved |
+|---|---|---|
+| https://... | Latest stable: X.Y.Z | YYYY-MM-DD |
+```
+
+A round file that asserts any of the fact types above **without a corresponding row in
+the Live Research Log** is making a training-data-only claim. The synthesizer treats
+such claims as contested (not given) and flags them.
+
+**When live research is optional:** Purely architectural / pattern decisions (e.g., "data
+source vs import," "rate limiter at BFF vs gateway") do not require live fetching. Include
+a `## Live Research Log` section with `N/A — no version/status/pricing/API-surface claims in this round`
+if nothing was fetched, so the synthesizer can confirm the omission was deliberate.
 
 > **Useful tools:** For coding, architecture decisions, or verifying version/API facts —
 > both of these optional MCP tools are worth consulting if available:

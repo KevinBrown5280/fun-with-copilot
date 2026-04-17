@@ -32,6 +32,24 @@ If a current-round file is missing and its agent is listed in `missing_agents`, 
 If round > 1, also attempt to read the four per-model output files from the prior round (`round-{N-1}-opus.md`, `round-{N-1}-codex.md`, `round-{N-1}-gpt.md`, `round-{N-1}-sonnet.md`) to extract each model's previous vote (needed for the vote_changes comparison). If a prior-round file is missing (the model was absent due to degradation), skip it for the vote_changes comparison and treat that model's prior vote as absent — do not error. Read `round-{N-1}-metadata.json` (if it exists) to obtain the `missing_agents` list for the prior round. If the metadata file is absent, fall back to the `missing_agents_previous_round` input (if provided) to identify which files are expected to be absent. Do NOT read `round-{N-1}-synthesis.md` for this purpose — it is not a debater file and does not contain a model vote. When round = 1, there are no prior-round files — set vote_changes to an empty array.
 `round-N-metadata.json` is also the canonical source for the current round's `missing_agents`; the debate-round agent writes it before returning, and the orchestrator should pass its contents as this step's `missing_agents` input.
 
+### 1.5. Validate Live Research Log (fact-dependent DQs only)
+
+After reading each round file, check whether any DQ in context.md involves observable
+facts (version numbers, GA/Preview/EOS status, support lifecycle dates, pricing). If yes:
+
+For each debater's round file, record:
+- **`present`** — the file contains a `## Live Research Log` section with at least one table row that includes a URL (not just `N/A`)
+- **`n/a`** — the file contains a `## Live Research Log` section but all content is `N/A` (debater declared no live research needed)
+- **`missing`** — no `## Live Research Log` section found at all
+
+Then scan **every** round file (regardless of status) for claims asserting specific version
+numbers, GA/Preview/EOS status, pricing, or API surface changes. For each such claim found:
+- **`missing` status:** the claim is training-data-only — flag it.
+- **`n/a` status:** the debater declared no research was needed, but is making a factual claim — flag it as training-data-only.
+- **`present` status:** check whether the claim corresponds to a source URL already in the log. If no log row plausibly supports the claim, flag it as training-data-only even though the log section exists.
+
+Include results in the synthesis `## Live Research Audit` section (see step 3).
+
 ### 2. Read process rules
 
 Read the `debate-rules` skill for:
@@ -47,6 +65,16 @@ Create `<workspace>/round-N-synthesis.md` containing:
 - **Where they disagree** — the actual split, by agent name and argument
 - **Unresolved questions** — issues to address in the next round
 - **Directed questions** — specific questions for specific agents based on their positions
+- **Live Research Audit** — for each debater: `present | n/a | missing`. For any debater with status `missing` or `n/a` who made version/status/pricing claims: list each claim verbatim and annotate it `[TRAINING-DATA-ONLY — NOT VERIFIED]`. Add a directed question to that debater to fetch a primary source in the next round. Example format:
+  ```
+  ## Live Research Audit
+  | Debater | Status | Training-data-only claims |
+  |---|---|---|
+  | opus | present | — |
+  | gpt | n/a | — |
+  | codex | missing | ".NET 10 Worker SDK is at 2.x" [TRAINING-DATA-ONLY] |
+  ```
+  If all debaters are `present` or `n/a` with no unverified claims, write: `All debaters satisfied live research requirements this round.`
 
 Keep synthesis descriptive, not evaluative, throughout all rounds.
 
