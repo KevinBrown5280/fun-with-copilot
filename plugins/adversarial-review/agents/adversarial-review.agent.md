@@ -82,9 +82,12 @@ Check for `.adversarial-review/` at the repo root. If absent, create:
 .adversarial-review/
 ├── dismissed-findings.jsonl   (empty file)
 ├── confirmed-findings.jsonl   (empty file)
-└── reports/                   (empty directory)
+├── reports/                   (empty directory)
+└── fetch-cache/               (empty directory — index.jsonl and content files created on first fetch)
 ```
 Do **not** create `config.json` — that is the user's file, written manually only when overrides are needed.
+
+**Fetch cache bootstrap compaction:** After creating/verifying the directory structure, check `fetch-cache/index.jsonl`. If it exists and has more than 200 lines: read all lines, skipping any that are malformed (not valid JSON or missing required fields — log `"WARN: skipping malformed fetch-cache index line"` and continue); among valid lines, if multiple entries share the same dedup key (computed as `JSON.stringify([key, source, canonical-sorted-args-json])` — see §2 dedup key rules) keep only the last occurrence; sort remaining valid entries by `fetched_at` descending (entries with missing/unparseable `fetched_at` sort last); keep the top 200; rewrite the file atomically (write to `index.jsonl.tmp` then rename to `index.jsonl`); delete any content `.md` files in `fetch-cache/` whose filename is no longer referenced by the surviving entries.
 
 ### Step 2 — Initialize in-memory suppression sets
 
@@ -129,6 +132,35 @@ The checkpoint write persists non-reconstructable run-state so a session interru
 
 **Fields to serialize:**
 `session_id`, `phase`, `current_cycle`, `run_start_cycle`, `mode`, `profile`, `scope`, `scope_manifest_path`, `findings[]`, `vote_records{}`, `coverage_maps`, `debate_round_history[]`, `cumulative_rounds{}`, `phase_flags{}`, `unresolved_cycle_history[]`
+
+**`fetch_cache` — external data deduplication cache:**
+Two-part structure under `.adversarial-review/fetch-cache/`:
+- **`index.jsonl`** — one small JSON object per line; agents scan this to check for cache hits (stays kilobytes regardless of fetch count)
+- **`<hash>.md`** — one content file per unique fetch; agents open only the file they need
+
+**Index line shape:** `{ "key": "...", "source": "...", "args": {...}, "file": "<hash>.md", "fetched_at": "ISO-8601", "truncated": false }`. Covers all external data retrievals:
+- `web_fetch` → `key` = URL, `source` = `"web_fetch"`, `args` = `{ "raw": <bool>, "max_length": <int>, "start_index": <int> }` — always include all three fields explicitly; see dedup key rules below for canonical defaults
+- URL-based MCP fetches (e.g. `microsoft-learn-microsoft_docs_fetch`) → `key` = URL, `source` = exact tool name as invoked (e.g. `"microsoft-learn-microsoft_docs_fetch"`), `args` = `{}`
+- Query-based MCP searches (e.g. `microsoft-learn-microsoft_docs_search`, `microsoft-learn-microsoft_code_sample_search`) → `key` = query string, `source` = exact tool name as invoked, `args` = any additional params (e.g. `{ "language": "csharp" }`)
+
+**Source names must be the exact tool name as invoked** — e.g. `"microsoft-learn-microsoft_docs_fetch"` not `"microsoft_docs_fetch"`. Dedup key is `JSON.stringify([key, source, canonical-sorted-args-json])` — a JSON array of three strings — so the fields are structurally separated and cannot collide regardless of their contents. `canonical-sorted-args-json` is **minified JSON with keys sorted lexicographically** (e.g. `{"language":"csharp","max_length":5000}`). `web_fetch` default values are `raw: false`, `max_length: 5000`, `start_index: 0` — always include these explicitly in `args` so the hash is stable regardless of whether defaults were passed. `file` is named by the first 32 hex characters of SHA-256 of that dedup key string (UTF-8 encoded). Use SHA-256 specifically — no other algorithm — so all agents compute identical filenames for identical requests. `truncated: true` is set when content exceeded the 20 KB cap.
+
+**Write path (agent-direct — no orchestrator involvement):**
+1. Compute the dedup key and its SHA-256 filename.
+2. If `fetch-cache/<hash>.md` **already exists and is not truncated** (check the index for the **last** entry where `file` equals `<computed-hash>.md` — equivalent to looking up by dedup key, since `file` = SHA-256(dedup-key); if its `truncated` field is `false`, skip the content write and go directly to step 4). If that last entry has `truncated: true`, overwrite the file with the new full response.
+3. Write full response to `fetch-cache/<hash>.md`. If response exceeds 20 KB, truncate at the nearest paragraph boundary and set `truncated: true` in the index line.
+4. Append one index line to `fetch-cache/index.jsonl`. (Always append — even on a non-truncated hit from step 2 — to refresh `fetched_at`, which biases compaction toward recently-used entries.)
+
+**Read path (agent-direct — no injection):**
+1. If `fetch-cache/index.jsonl` does not exist, treat the cache as empty — proceed to live call.
+2. Read `index.jsonl` and build a `(dedup-key) → {file, truncated}` map. For duplicate entries of the same dedup key, use the **last occurrence** (newest append wins).
+3. On hit: if `truncated: false`, use cached content and skip the live call. If `truncated: true`, make the live call anyway (cached content is incomplete).
+4. On miss: proceed with the live call.
+5. **Not cacheable:** any MCP tool that writes state, triggers actions, or has side effects. If a content file referenced in the index is missing or unreadable, treat that entry as a miss and make the live call.
+
+**Deduplication guarantee:** Sequential agents and subsequent runs reuse prior results. Parallel agents within the same batch may independently fetch and cache the same key — duplicate index entries are harmless (last-match-wins resolves them correctly). The 200-entry cap is enforced by the orchestrator at bootstrap (see Step 1), not by individual agents.
+
+Index and content files persist until the user removes them.
 
 **Write pattern (atomic):**
 1. Serialize the fields above to JSON.
@@ -332,7 +364,7 @@ After the skeptic round (§6.5) resolves — or after normal debate if the skept
 1. Collect all findings with status = `confirmed`.
 2. If zero confirmed findings, skip this section.
 3. For each confirmed finding, determine if it contains **externally-verifiable factual claims** — claims about library behavior, API surface, security protocols, framework conventions, browser compatibility, deprecated patterns, CVEs, or platform-specific behavior. Findings that are purely structural/logic issues (null checks, duplicate code, control flow) are marked `not-applicable` and skip verification. **Claim extraction:** For each finding that requires verification, extract specific factual claims as a numbered list: scan the finding's `description` and `evidence` for every sentence or clause that makes an externally-verifiable assertion (e.g., "X requires .NET 8+", "Y is deprecated since v3", "calling Z without ConfigureAwait(false) causes deadlocks in library code per Microsoft guidance"). Exclude structural observations (null checks, control flow, code duplication) and subjective judgments. Format as: `(1) <claim>; (2) <claim>; ...`. If fewer than 1 verifiable claim can be extracted, mark as `not-applicable`. Populate `{FACTUAL_CLAIMS}` in the live-data verification prompt with this numbered list, or with `"none"` if not applicable.
-4. Group findings requiring verification by technology domain using a **deterministic precedence rule**: assign each finding to the first matching domain from this fixed priority list: `ASP.NET Core`, `Entity Framework Core`, `Azure SDK`, `React/Next.js`, `Node.js/Express`, `TypeScript/JavaScript`, `Go stdlib`, `Python`, `Terraform`, `PowerShell`, `Config/JSON/YAML`. Match against framework/library tokens found in `description` / `evidence` / `suggested_fix`; if none match, fall back to the primary file-extension family; if that is still ambiguous, use `misc:<extension-or-unknown>`. After every finding has a domain label, sort by `(DOMAIN, finding_id)` and chunk same-domain findings into batches of 1–5. Launch **one `general-purpose` agent per domain-batch** (P-4), up to **10 in parallel** (raised from 5). If more than 10 domain-batches total, process in sequential rounds of 10. Populate `{DOMAIN}` with the domain label (e.g., `"ASP.NET Core"`, `"React/TypeScript"`, `"Go stdlib"`) and `{FINDING_COUNT}` with the batch size. Use the live-data verification prompt template from the `review-templates` skill. Set `agent_type: "general-purpose"` (not `code-review` — verification agents need web_fetch and documentation tools, not code-review specialization). **Run ALL verification batches first** before any re-debates — collect all results, then handle contradictions in step 6.
+4. Group findings requiring verification by technology domain using a **deterministic precedence rule**: assign each finding to the first matching domain from this fixed priority list: `ASP.NET Core`, `Entity Framework Core`, `Azure SDK`, `React/Next.js`, `Node.js/Express`, `TypeScript/JavaScript`, `Go stdlib`, `Python`, `Terraform`, `PowerShell`, `Config/JSON/YAML`. Match against framework/library tokens found in `description` / `evidence` / `suggested_fix`; if none match, fall back to the primary file-extension family; if that is still ambiguous, use `misc:<extension-or-unknown>`. After every finding has a domain label, sort by `(DOMAIN, finding_id)` and chunk same-domain findings into batches of 1–5. Launch **one `general-purpose` agent per domain-batch** (P-4), up to **10 in parallel** (raised from 5). If more than 10 domain-batches total, process in sequential rounds of 10. Populate `{DOMAIN}` with the domain label (e.g., `"ASP.NET Core"`, `"React/TypeScript"`, `"Go stdlib"`) and `{FINDING_COUNT}` with the batch size. Use the live-data verification prompt template from the `review-templates` skill. Set `agent_type: "general-purpose"` (not `code-review` — verification agents need web_fetch and documentation tools, not code-review specialization). **Fetch cache (applies to ALL agent launches that may call external data tools — §6.7, §6.5 re-debates, §5/§6 debate rounds, and any other general-purpose agent):** Follow the full protocol in §2 `fetch_cache` definition (index line schema, SHA-256 hash algorithm, dedup key construction including args, write-path file-exists check, last-match-wins read, truncation flag, missing-file fallback). Use exact tool names as invoked for `source` (e.g. `"microsoft-learn-microsoft_docs_fetch"`, `"microsoft-learn-microsoft_docs_search"`). **Run ALL verification batches first** before any re-debates — collect all results, then handle contradictions in step 6.
    - `web_fetch` for general documentation
    - Microsoft Learn documentation tools (for example `microsoft-learn-microsoft_docs_search`, `microsoft-learn-microsoft_docs_fetch`, `microsoft-learn-microsoft_code_sample_search`) for Microsoft/.NET/Azure
    - Any other official documentation tools available in the runtime
