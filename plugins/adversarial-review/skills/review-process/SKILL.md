@@ -7,27 +7,41 @@ description: >
 
 # Review Process
 
-## Fingerprint Computation (`fp_v1`)
+**Normative precedence:** this skill is a reusable process module referenced by `agents\adversarial-review.agent.md`. If any wording here diverges from the agent spec, the **agent spec wins**.
 
-Compute the fingerprint for every finding before reconciliation. This is the deduplication and suppression mechanism.
+## Exact Fingerprint (`fp_v1`) and Occurrence Key (`occ_v1`)
 
-### Algorithm
+Compute two deterministic identities for every finding before reconciliation:
+
+- **`fp_v1`** — exact-match fingerprint for collision-safe suppression/audit when title + evidence text are materially the same
+- **`occ_v1`** — locator-backed occurrence key for suppressing, deduplicating, or carry-forward tracking of the same code occurrence when title/evidence wording drifts across models or cycles
+
+`fp_v1` remains the exact canonical identity. `occ_v1` is supplementary and is used only when a stable locator anchor is available.
+
+### Exact fingerprint algorithm
 
 ```
 fp_v1 = sha256(normalized_category + "|" + normalized_repo_path + "|" + normalized_symbol + "|" + normalized_title + "|" + normalized_evidence)
 ```
 
-Truncate the hex digest to the first **24 characters** (96 bits of entropy — birthday-safe to ~1 billion entries).
+### Occurrence key algorithm
+
+```
+occ_v1 = sha256(normalized_category + "|" + normalized_repo_path + "|" + normalized_symbol + "|" + normalized_locator_anchor)
+```
+
+Truncate both hex digests to the first **24 characters** (96 bits of entropy — birthday-safe to ~1 billion entries).
 
 ### Normalization rules
 
 | Field | Rule |
 |-------|------|
 | `normalized_category` | Lowercase. Must be one of: security, correctness, reliability, performance, maintainability, accessibility, documentation, testing, configuration |
-| `normalized_repo_path` | Repo-relative path, lowercase, forward-slash normalized. Example: `src/api/controllers/workoutcontroller.cs` |
-| `normalized_symbol` | Symbol/function/class name if known, lowercase. If null, empty string, or no symbol applies, use `"<file>"`. Example: `getworkoutplan`. **Note:** this is the function/class/method name — it is NOT the review scope mode (`full`, `local`, etc.). |
+| `normalized_repo_path` | Repo-relative path with forward-slash normalization and trimming only. **Preserve original case** for identity computation; some repos are case-sensitive. Example: `src/api/controllers/WorkoutController.cs` |
+| `normalized_symbol` | Symbol/function/class name if known, trimmed but **case-preserving**. If null, empty string, or no symbol applies, use `"<file>"`. Example: `GetWorkoutPlan`. **Note:** this is the function/class/method name — it is NOT the review scope mode (`full`, `local`, etc.). Case-insensitive reasoning belongs in semantic dedup, not exact identity. |
 | `normalized_title` | Lowercase, punctuation collapsed (replace sequences of non-alphanumeric chars with single space), trimmed. Example: `missing input validation on workout id` |
 | `normalized_evidence` | Lowercase, all whitespace collapsed to single space, trimmed. Then apply literal substitutions in this order: **(1) String literals** — replace content between matching `"..."` or `'...'` delimiters (exclusive of delimiters) with `<STR>`. Use a **non-greedy (shortest-match)** algorithm; if the evidence contains an escaped delimiter (e.g., `\"` inside a `"`-delimited string), treat the escaped character as literal and do not close the string at that point. Only single-line string content applies; do not match across newlines. Template literals and raw strings are not substituted (too ambiguous — leave as-is). **(2) Numeric literals** — replace tokens matching `0[xX][0-9a-fA-F]+` (hex) or `[0-9]+([._][0-9]+)*([eE][+-]?[0-9]+)?` (decimal/float/version) that are bounded by non-alphanumeric characters or string boundaries, with `<NUM>`. Underscore-separated numbers (e.g., `1_000_000`) are included. Do NOT substitute numbers that are part of identifiers (e.g., `catch2`, `net8`, `v2`, `IAsyncEnumerable<T>` — these are part of a word token and not bounded on both sides by non-alphanumeric chars). After all substitutions, apply **middle-preserving truncation**: take the first 100 characters + `···` + the last 100 characters. If the normalized result is ≤ 200 characters, use it in full (no truncation). This preserves context-identifying head and specificity-bearing tail while avoiding collision risk from common boilerplate tails. *(A-3)* |
+| `normalized_locator_anchor` | Used only for `occ_v1`. Preferred form: `L{start_line}-L{end_line}` from reviewer-provided `locator`. If no reviewer locator is present, the orchestrator may infer the anchor from S-1 evidence verification **only when the snippet resolves to a unique line span in the current file**. If the match is missing, ambiguous, or the path is deleted/renamed with no stable line span, `normalized_locator_anchor = null` and `occ_v1` is omitted for that finding. |
 
 > **Implementation note — prefer PowerShell (no extra dependencies):**
 > ```powershell
@@ -45,39 +59,43 @@ Truncate the hex digest to the first **24 characters** (96 bits of entropy — b
 > `.adversarial-review/session-state.json` per §2 Steps 0 and 4 of the agent spec — not in SQL.  
 > The pseudocode below uses Python-style dict/list notation to describe in-memory operations only. *(F-c1-010)*
 
-After computing `fp_v1` for a new finding, query `dismissed_findings`:
+After computing `fp_v1` and, when possible, `occ_v1` for a new finding, query `dismissed_findings`:
 ```python
 fp_v1 in dismissed_fps  # check if fingerprint is in the in-memory dismissed_fps set  # F-c1-010, F-c2-003
 ```
 
-- **Match found — same canonical_fields:** Mark finding as `suppressed`. Do not include in voting.
+- **Exact match found — same canonical_fields:** Mark finding as `suppressed`. Do not include in voting.
   - To retrieve the stored entry for canonical_fields comparison, iterate the **list** `dismissed_fp_index[fp_v1]` (O(1) reverse lookup by fingerprint to the collision bucket — populated at bootstrap alongside `dismissed_fps`).
-- **Match found — different canonical_fields:** Hash collision. Do NOT suppress. Flag the finding with `collision = true` and include it in normal voting.
+- **Exact match found — different canonical_fields:** Hash collision. Do NOT suppress. Flag the finding with `collision = true` and include it in normal voting.
+- **No exact match, but `occ_v1` is non-null and `occ_v1 in dismissed_occurrence_keys`:** Iterate `dismissed_occurrence_index[occ_v1]`. If any stored row has matching `occurrence_fields`, mark the finding as `suppressed` by occurrence-key match. This suppresses the same locator-backed code occurrence even when title/evidence wording drifted. If no stored row has matching `occurrence_fields`, treat as an occurrence-key collision and continue normally.
 - **No match:** Proceed to reconciliation.
 
 **Confirmed-finding suppression check (mode-dependent):**
 
-After the dismissed check above, also check against the mode-appropriate confirmed fingerprint set:
+After the dismissed check above, also check against the mode-appropriate confirmed exact/occurrence sets:
 
-- In **review-only** mode: check `fp_v1 in confirmed_all_fps`
-- In **review-and-fix** mode: check `fp_v1 in confirmed_fps`
+- In **review-only** mode: check `fp_v1 in confirmed_fps or fp_v1 in run_confirmed_fps` **or** `occ_v1 in confirmed_occurrence_keys or occ_v1 in run_confirmed_occurrence_keys` when `occ_v1` is non-null
+- In **review-and-fix** mode: check `fp_v1 in confirmed_fps` **or** `occ_v1 in confirmed_occurrence_keys` when `occ_v1` is non-null
 
 ```python
 # Review-only mode:
-fp_v1 in confirmed_all_fps  # suppress all previously confirmed findings  # F-c7-005
+fp_v1 in confirmed_fps or fp_v1 in run_confirmed_fps  # suppress only fixed cross-session findings plus same-run confirmed findings  # F-c7-005
 # Review-and-fix mode:
 fp_v1 in confirmed_fps  # suppress only fixed confirmed findings
 ```
 
 Apply the same match/collision logic as the dismissed check:
-- **Match found — same canonical_fields:** Mark finding as `suppressed`. Do not include in voting.
-  - To retrieve the stored entry for canonical_fields comparison, iterate the **list** `confirmed_fp_index[fp_v1]` (O(1) reverse lookup by fingerprint to the collision bucket — populated at bootstrap alongside `confirmed_fps`/`confirmed_all_fps`; see §2 Step 2).
-- **Match found — different canonical_fields:** Hash collision. Do NOT suppress. Flag `collision = true`.
+- **Exact match found — same canonical_fields:** Mark finding as `suppressed`. Do not include in voting.
+  - To retrieve the stored entry for canonical_fields comparison, iterate the **list** `confirmed_fp_index[fp_v1]` (O(1) reverse lookup by fingerprint to the collision bucket — populated at bootstrap alongside `confirmed_fps`, `confirmed_all_fps`, and `run_confirmed_fps`; see §2 Step 2).
+- **Exact match found — different canonical_fields:** Hash collision. Do NOT suppress. Flag `collision = true`.
+- **No exact match, but `occ_v1` is non-null and an allowed confirmed occurrence set contains it:** iterate `confirmed_occurrence_index[occ_v1]`. If any stored row has matching `occurrence_fields`, mark the finding as `suppressed` by occurrence-key match. If none do, treat as an occurrence-key collision and continue normally.
 - **No match:** Proceed to reconciliation.
 
-This is the authoritative reconciliation-time suppression gate. The prompt-level hint (injecting fingerprints into reviewer prompts) is best-effort only — reviewers may ignore it. This check is the defense-in-depth backstop that prevents previously confirmed findings from re-entering voting.
+This is the authoritative reconciliation-time suppression gate. The prompt-level hint (injecting fingerprints into reviewer prompts) is best-effort only — reviewers may ignore it. This exact-plus-occurrence check is the defense-in-depth backstop that prevents previously decided findings from re-entering voting because of minor wording drift.
 
-**Canonical format for `canonical_fields`:** A pipe-delimited string matching the `fp_v1` input order: `category|repo_path|symbol|title|evidence` (all values normalized per the `fp_v1` rules above; `symbol` = normalized_symbol value: symbol/function/class name or `"<file>"`). This deterministic format ensures equality comparison is reliable across sessions and serialization boundaries. Both the §7 dismissal ledger write and the suppression check here must use this exact format.
+**Canonical format for `canonical_fields`:** A pipe-delimited string matching the `fp_v1` input order: `category|repo_path|symbol|title|evidence` (all values normalized per the `fp_v1` rules above; `symbol` = normalized_symbol value: symbol/function/class name or `"<file>"`). This exact format is used for exact-fingerprint collision checks.
+
+**Canonical format for `occurrence_fields`:** A pipe-delimited string matching the `occ_v1` input order: `category|repo_path|symbol|locator_anchor`. This format is used for occurrence-key collision checks and locator-backed suppression. When `locator_anchor` is unavailable, `occurrence_fields = null` and `occ_v1` is omitted.
 
 ---
 
@@ -86,57 +104,72 @@ This is the authoritative reconciliation-time suppression gate. The prompt-level
 **Reviewer output validation (before reconciliation):** *(F-c9-009)*
 After all 4 reviewer agents complete, for each reviewer:
 1. Count the number of JSON objects successfully parsed from the output (valid finding lines with required fields).
-2. Extract the `REVIEW_COMPLETE: N` count from the end of the output.
-3. If `parsed_count < declared_count`: log `"WARN: Reviewer {model} declared {declared_count} findings but only {parsed_count} were parseable ({declared_count - parsed_count} malformed/missing lines)."`
-   - **Partial recovery (A-9):** If `parsed_count > 0` AND gap (`declared_count - parsed_count`) ≥ 2: send a recovery prompt to that reviewer agent: *"Your previous output was truncated. You declared {declared_count} findings but only {parsed_count} were parseable. The last successfully parsed finding had id `{last_parsed_id}`. Re-output all findings after that one, in the same JSONL format."* Merge any successfully parsed recovery findings with the original batch. If recovery fails or yields 0 additional parseable findings, proceed with what was originally parsed and log the gap in the §10 report. **Note — gap=1 is not recovered by design:** a gap of exactly 1 is treated as normal trailing truncation (the final finding line was cut mid-write, which is common at context limits); recovery is skipped to avoid a round-trip for a single marginal line. A WARN log is still emitted. If this threshold is too lossy for your use case, lower to ≥1 via config (not yet configurable — raise an issue).
-4. If `parsed_count == 0` AND `declared_count > 0`: log `"ERROR: Reviewer {model} returned 0 parseable findings vs declared {declared_count} — output may be entirely malformed."` and attempt one retry of that reviewer agent. If retry also yields 0 parseable findings, proceed with 0 for that reviewer and flag in the §10 report (per §13 rule 6a — do not stall waiting for user input).
+2. Extract the integer count from the exact trailer line `REVIEW_COMPLETE: N findings` at the end of the output. If the trailer is missing or malformed, log `"WARN: Reviewer {model} omitted valid REVIEW_COMPLETE trailer — treating declared_count as parsed_count for this batch."`, set `declared_count = parsed_count`, and mark `review_complete_valid = false`; otherwise `review_complete_valid = true`.
+3. Extract the `REVIEW_RECEIPTS: [...]` line. If it is missing or malformed, log `"WARN: Reviewer {model} provided no valid REVIEW_RECEIPTS — treating receipt coverage as zero until catch-up repairs it."`, treat the reviewer as having completed zero deterministic receipt batches, and mark `receipts_valid = false`. `FILES_REVIEWED` remains an audit/debug signal only. Otherwise `receipts_valid = true`.
+4. If `parsed_count < declared_count`: log `"WARN: Reviewer {model} declared {declared_count} findings but only {parsed_count} were parseable ({declared_count - parsed_count} malformed/missing lines)."`
+   - **Partial recovery (A-9):** If `parsed_count > 0` AND gap (`declared_count - parsed_count`) ≥ 1: send a recovery prompt to that reviewer agent: *"Your previous output was truncated. You declared {declared_count} findings but only {parsed_count} were parseable. The last successfully parsed finding had id `{last_parsed_id}`. Re-output all findings after that one, in the same JSONL format."* Merge any successfully parsed recovery findings with the original batch. If recovery fails or yields 0 additional parseable findings, proceed with what was originally parsed and log the gap in the §10 report.
+5. If `parsed_count == 0` AND `declared_count > 0`: log `"ERROR: Reviewer {model} returned 0 parseable findings vs declared {declared_count} — output may be entirely malformed."` and attempt one retry of that reviewer agent. If retry also yields 0 parseable findings, proceed with 0 for that reviewer and flag in the §10 report (per §13 rule 6a — do not stall waiting for user input).
+6. **Usable blind-review output (for the 3-of-4 viability gate):** count a reviewer as **usable** only if either (a) `parsed_count > 0`, or (b) `parsed_count == 0` **and** `review_complete_valid == true` **and** `declared_count == 0` **and** `receipts_valid == true`. A reviewer with 0 parseable lines plus malformed/missing trailers is **not** a zero-findings success; it counts as a failed blind-review agent for §13 rule 6a / A-8 precondition purposes.
 
 The reconciliation set is the **union of all non-suppressed findings** raised by any of the 4 reviewers.
 
 **File coverage check before debate (A-8):**
-After computing the reconciliation set, cross-reference FILES_REVIEWED against the canonical scope file list:
-1. For each scoped file, count how many of the 4 reviewers listed it in their FILES_REVIEWED output.
-2. Build `missed_files_by_reviewer` from the canonical scope file list minus each reviewer's FILES_REVIEWED list. For each reviewer with missed files: log `"WARN: Reviewer {model} missed {count} scoped file(s) — triggering bounded catch-up review."` Launch one catch-up review per reviewer, chunked into batches of at most 25 files, using that reviewer's assigned model and the normal blind-review JSONL schema. Merge any new findings from the catch-up batches into the reconciliation set before evidence verification and deduplication.
-3. For each merged finding, compute `covering_roles` = the set of reviewer roles whose final FILES_REVIEWED list contains that finding's `file`.
-4. For findings in files with < 3-reviewer coverage: treat reviewers that did NOT list the file in FILES_REVIEWED as **abstaining**, not dismissing, for blind-tally purposes (they cannot confirm absence of findings they did not read). Adjust round-0 reasoning accordingly.
+**Precondition:** A-8 runs only if at least **3 of 4** blind-review agents produced usable outputs after the automatic retry path. If only 2 or fewer blind reviewers succeed, §13 rule 6a in the agent spec takes precedence: abort the cycle and emit a partial report. Catch-up review repairs missing **receipt coverage** from otherwise successful reviewers; it is **not** a substitute for missing reviewer diversity.
 
-**Evidence verification (S-1) — runs after A-8, before fingerprint dedup:**
+After computing the reconciliation set, expand reviewer `REVIEW_RECEIPTS` against the orchestrator's canonical receipt map:
+1. For each reviewer, resolve receipt IDs to their file batches and build that reviewer's authoritative covered-file set. `FILES_REVIEWED` remains an audit/debug list and may be used only for WARN messages or diagnostics when receipts are missing.
+2. For each scoped file, count how many of the 4 reviewers covered it via receipts.
+3. Build `missing_receipts_by_reviewer` from the canonical receipt map minus each reviewer's reported receipt IDs. For each reviewer with missing receipts: log `"WARN: Reviewer {model} missed {count} receipt batch(es) — triggering bounded catch-up review."` Launch one catch-up review per reviewer, reusing the exact missing receipt batches (same reviewer model, same blind-review JSONL schema). Merge any new findings from the catch-up batches into the reconciliation set before evidence verification and deduplication.
+4. For each merged finding, compute `covering_roles` = the set of reviewer roles whose final receipt-expanded coverage contains that finding's `file`.
+5. For findings in files with < 3-reviewer coverage: treat reviewers that did NOT cover the file via receipts as **abstaining**, not dismissing, for blind-tally purposes (they cannot confirm absence of findings they did not read). Adjust round-0 reasoning accordingly.
+
+**Evidence verification (S-1) — runs after A-8, before identity dedup:**
 After the coverage check (so micro-review findings are included), for each finding where `evidence` is non-null AND `file` is non-null:
 1. Extract the first 80 characters of the finding's `evidence` field (collapse whitespace only — **do not lowercase**).
-2. Search the cited `file` (repo-relative path) using a case-insensitive, whitespace-tolerant grep for that 80-char snippet.
-3. If no match is found: set `evidence_unverified: true` on the finding and log: `"WARN: Evidence for finding from {model} ('{title[:50]}') could not be located in {file} — may be hallucinated or misquoted."`
-4. Findings with `evidence_unverified: true` carry the flag into fingerprint dedup. The auto-dismiss decision (raise_count < 3) is applied **after fingerprint dedup** (step below) using the consolidated `raise_count` (number of distinct models that raised findings with matching fingerprint) — not the per-reviewer count here. This prevents losing consensus signal when multiple reviewers cite the same bug with slightly different evidence excerpts.
-5. All findings with `evidence_unverified: true` are listed in the §10 "Evidence-Unverified Findings" section regardless of outcome.
+2. If the cited path is absent from the current workspace **and** it came from deleted/renamed diff scope, skip current-file verification: annotate `evidence_verification_skipped: "deleted_or_renamed_path"`, log `"INFO: Skipping current-file evidence verification for deleted/renamed path {file} — diff context must be reviewed instead."`, and do **not** set `evidence_unverified`.
+3. Otherwise, if the finding includes `locator.start_line` / `locator.end_line`, search the cited `file` within that line window first (allowing a small +/-2-line tolerance for formatter drift). If the snippet matches there, mark the locator as verified and set `locator_anchor = "L{matched_start}-L{matched_end}"`.
+4. If the locator window search fails, fall back to a case-insensitive, whitespace-tolerant grep of the full cited file for the 80-char snippet.
+5. If the fallback search finds exactly one unique match span, set `locator_anchor = "L{matched_start}-L{matched_end}"` for `occ_v1` computation. If it finds multiple matches, leave `locator_anchor = null` and continue without an occurrence key for this finding.
+6. If no match is found after both checks: set `evidence_unverified: true` on the finding and log: `"WARN: Evidence for finding from {model} ('{title[:50]}') could not be located in {file} — may be hallucinated, misquoted, or have a stale locator."`
+7. Findings with `evidence_unverified: true` carry the flag into identity dedup. The auto-dismiss decision (raise_count < 3) is applied **after exact-fingerprint and occurrence-key dedup** (step below) using the consolidated `raise_count` (number of distinct models that raised findings merged into the final group) — not the per-reviewer count here. This prevents losing consensus signal when multiple reviewers cite the same bug with slightly different wording. Findings marked `evidence_verification_skipped: "deleted_or_renamed_path"` are **not** eligible for this auto-dismiss path.
+8. All findings with `evidence_unverified: true` are listed in the §10 "Evidence-Unverified Findings" section regardless of outcome.
 
 **Only record findings that were actually raised in reviewer output with explicit evidence.** Do not infer, interpolate, or add findings that no reviewer raised. If a finding lacks an `evidence` field citing exact code, treat it as invalid and discard it before voting.
 
 ### Deduplication before voting
 
-Group findings by fingerprint. Findings with the same fingerprint from different reviewers are treated as the **same finding**. Merge them: use the most detailed description, combine evidence, note all raising models.
+1. **Exact-fingerprint dedup:** Group findings by `fp_v1`. Findings with the same exact fingerprint from different reviewers are treated as the **same finding**. Merge them: use the most detailed description, combine evidence, note all raising models, and union `covering_roles`.
+2. **Occurrence-key dedup:** For remaining groups with non-null `occ_v1`, merge groups that share the same `occurrence_fields`. This is specifically for reworded duplicates of the same locator-backed code occurrence. Preserve the union of `covering_roles` and raising models across the merged group. If two groups share `occ_v1` but the Jaccard similarity of their normalized `(title + description)` strings is **< 0.35**, keep them separate and annotate both with `occurrence_collision: true` instead of auto-merging.
 
-**Post-fingerprint-dedup: apply `evidence_unverified` raise_count auto-dismiss:**
-After fingerprint dedup, for each merged finding that has `evidence_unverified: true`, check the consolidated `raise_count` (number of distinct models that contributed to this fingerprint group):
+**Merged-field survival rules (apply after exact-fingerprint dedup, occurrence-key dedup, and semantic auto-merge):**
+- `fingerprint` / `canonical_fields`: if the merged group came from exact-fingerprint dedup, retain the shared `fp_v1` and `canonical_fields`. Otherwise retain the representative finding's `fingerprint` and `canonical_fields`, where representative = the finding raised by more distinct models, or the first-encountered finding in stable processing order if tied.
+- `occurrence_key` / `occurrence_fields`: if every non-null contributor carries the same `occurrence_fields`, keep that pair; if contributors are a mix of that pair and nulls, keep the non-null pair; if contributors carry multiple distinct non-null `occurrence_fields`, clear both fields on the merged finding and set `occurrence_collision: true` rather than picking one arbitrarily.
+- `locator`: if a surviving `occurrence_fields` pair remains, keep the locator from the contributor for that pair with the lexicographically earliest `(start_line, end_line, file, reviewer_role)` tuple among non-null locators. If no surviving occurrence pair remains, keep the lexicographically earliest non-null locator across the merged group using that same tuple. If all locators are null, keep null.
 
-**`evidence_unverified` flag merge rule:** When multiple reviewers contribute to the same fingerprint group, the merged finding has `evidence_unverified: true` if **ANY** contributing reviewer finding had the flag set (OR logic). After merging, re-run the 80-char snippet search against the combined evidence to give the merged finding a chance to clear the flag before the raise_count check.
+**Post-identity-dedup: apply `evidence_unverified` raise_count auto-dismiss:**
+After exact-fingerprint and occurrence-key dedup, for each merged finding that has `evidence_unverified: true`, check the consolidated `raise_count` (number of distinct models that contributed to this merged group):
 
-- If `raise_count < 3`: **auto-dismiss** (explicit pre-debate bypass — fewer than 3 reviewers raised this fingerprint AND evidence is unverifiable). Mark the merged finding `status = "dismissed"` and `dismissal_source = "evidence_unverified"` immediately, but **do not write §7 yet**. Carry the finding through semantic dedup and stable-ID assignment so it receives a normal orchestrator `F-c...` ID before any durable write. **Debate-path rule:** once this auto-dismiss is applied, the finding is removed from blind-tally / `contested` partitioning and must not enter §5/§6 debate, §6.5 skeptic re-debate, or §6.7 live-data re-debate. It proceeds directly to the dismissed/report flow after stable-ID assignment. Log: `"Auto-dismissed pending stable ID assignment: evidence_unverified and raise_count={raise_count} < 3."` In **exhaustive** profile, write the §7 dismissal entry later in the normal ledger-write pass using the stable `F-c...` ID. In **fast** profile, do **not** write a durable ledger entry — keep the dismissal report-only for this session.
+**`evidence_unverified` flag merge rule:** When multiple reviewers contribute to the same merged group, the merged finding has `evidence_unverified: true` if **ANY** contributing reviewer finding had the flag set (OR logic). After merging, re-run the 80-char snippet search against the combined evidence to give the merged finding a chance to clear the flag before the raise_count check.
+
+- If `raise_count < 3`: **auto-dismiss** (explicit pre-debate bypass — fewer than 3 reviewers raised this merged identity group AND evidence is unverifiable). Mark the merged finding `status = "dismissed"` and `dismissal_source = "evidence_unverified"` immediately, but **do not write §7 yet**. Carry the finding through stable-ID assignment so it receives a normal orchestrator `F-c...` ID before any durable write. **Semantic-dedup isolation rule:** once this auto-dismiss is applied, the finding is removed from blind-tally / `contested` partitioning **and** from the semantic auto-merge candidate set; a pre-dismissed evidence-unverified group may not absorb, or be absorbed by, a non-dismissed finding. **Debate-path rule:** once this auto-dismiss is applied, the finding must not enter §5/§6 debate, §6.5 skeptic re-debate, or §6.7 live-data re-debate. It proceeds directly to the dismissed/report flow after stable-ID assignment. Log: `"Auto-dismissed pending stable ID assignment: evidence_unverified and raise_count={raise_count} < 3."` In **exhaustive** profile, write the §7 dismissal entry later in the normal ledger-write pass using the stable `F-c...` ID. In **fast** profile, do **not** write a durable ledger entry — keep the dismissal report-only for this session.
 - If `raise_count ≥ 3`: proceed to normal debate but include a note in the debate prompt: `"NOTE: Evidence for this finding could not be verified in the cited file. Reviewers should inspect the code directly before voting."`
 
-### Semantic dedup (post-fingerprint)
+### Semantic dedup (post-identity)
 
-After fingerprint-based dedup, perform a secondary semantic check:
+After exact-fingerprint and occurrence-key dedup, perform a secondary semantic check on the remaining **non-dismissed** findings only:
 
 1. Group remaining findings by `(file, category)`.
 2. Within each group, compare titles pairwise. If two findings target the same file, same category, and have substantially overlapping titles or descriptions (e.g., both reference the same code construct or configuration value), flag them as **candidate duplicates**.
-3. Compute Jaccard similarity on character 2-grams of the normalized titles. **Auto-merge** if Jaccard ≥ 0.65; **escalate to orchestrator** if 0.35–0.64; **keep separate** if < 0.35. Severity protection rule: **never auto-merge a `critical` or `high` severity finding into a lower severity** — escalate to orchestrator regardless of Jaccard score.
-   Merge rules (auto or orchestrator-approved):
-   - Use the most detailed description from either finding.
-   - Combine evidence from both findings.
-   - Use the higher severity if they differ.
-   - Record all raising models from both findings.
-   - Keep the fingerprint and ID of the finding raised by more models (or the first-encountered if tied).
-   - Log: `"Semantic merge (Jaccard={score:.2f}): {id_kept} absorbed {id_dropped} (same file/category, overlapping title)"`
-4. Record all merged pairs (auto and orchestrator-approved) in a `merged_findings` list for the §10 report "Semantically Merged Findings" section.
+3. Compute Jaccard similarity on character 2-grams of the normalized titles. **Auto-merge** if Jaccard ≥ 0.65. If Jaccard is 0.35–0.64, log a near-duplicate note for audit but **keep the findings separate**. If < 0.35, keep separate. Severity protection rule: **never auto-merge a `critical` or `high` severity finding into a lower severity** — keep the pair separate and log the blocked merge.
+    Merge rules (auto only):
+    - Use the most detailed description from either finding.
+    - Combine evidence from both findings.
+    - Use the higher severity if they differ.
+    - Record all raising models from both findings.
+    - Union `covering_roles` from both findings so later blind-tally logic keeps dismiss vs abstain correct.
+    - Representative finding = the finding raised by more models (or the first-encountered if tied); keep its reviewer-local identity as the representative during semantic dedup, apply the merged-field survival rules above for fingerprint/canonical/occurrence/locator fields, and let the orchestrator assign the final stable `F-c...` ID afterward.
+    - Log: `"Semantic merge (Jaccard={score:.2f}): {id_kept} absorbed {id_dropped} (same file/category, overlapping title)"`
+4. Record all merged pairs (auto only) in a `merged_findings` list for the §10 report "Semantically Merged Findings" section.
 
 ### Debate-to-consensus
 
@@ -149,9 +182,9 @@ After fingerprint-based dedup, perform a secondary semantic check:
 
 Decision policy depends on the active execution profile:
 - **`exhaustive`**: keep the unanimity baseline — 4/4 confirm = **Confirmed**, 0/4 confirm = **Dismissed**, any split triggers debate.
-- **`fast`**: 4/4 confirm = **Confirmed**; 3/4 confirm = **Confirmed** only when `evidence_unverified != true` **and** file coverage is at least 3/4 after A-8 catch-up; 0/4 confirm = **Dismissed**; 1/4 confirm = **Dismissed** as `fast_low_confidence` (report-only); any remaining split triggers the bounded fast debate loop.
+- **`fast`**: 4/4 confirm = **Confirmed**; 3/4 confirm = **Confirmed** only when the fourth reviewer is an `abstain` (no explicit dismiss), `evidence_unverified != true`, and file coverage is at least 3/4 after A-8 catch-up; 4/4 dismiss (= 0 confirm with no abstains) = **Dismissed**; 1/4 confirm = **Dismissed** as `fast_low_confidence` (report-only); any remaining split triggers the bounded fast debate loop.
 
-`file_coverage` = the number of reviewers whose final `FILES_REVIEWED` set includes the finding's file after the A-8 catch-up batches complete.
+`file_coverage` = the number of reviewers whose final receipt-expanded covered-file set includes the finding's file after the A-8 catch-up batches complete.
 
 **Round 1 — Blind review (§4 output)**
 
@@ -177,12 +210,20 @@ abstain_count = 4 - confirm_count - dismiss_count
   - Any abstain or split → **proceed to debate**
 - **Fast profile**
   - 4/4 confirm → **Confirmed** (skip debate)
-  - 3/4 confirm + `abstain_count == 0` + `evidence_unverified != true` + `file_coverage >= 3` → **Confirmed** (skip debate)
+  - 3/4 confirm + `dismiss_count == 0` + `evidence_unverified != true` + `file_coverage >= 3` → **Confirmed** (skip debate)
   - 4/4 dismiss → **Dismissed** (skip debate)
   - 1/4 confirm + `abstain_count == 0` → **Dismissed** with source `fast_low_confidence` (report-only; do not write durable ledgers)
-  - 2/4, or 3/4 without verified evidence / coverage → **proceed to bounded fast debate**
+  - 2/4, or 3/4 with any explicit dismiss, or 3/4 without verified evidence / sufficient coverage → **proceed to bounded fast debate**
 
 **Debate rounds — parallel algorithm**
+
+Before launching any debate agents, sort `contested` findings by `(severity desc, file, id)` and partition them into deterministic **debate batches**:
+- **`exhaustive`**: up to **8 findings per batch**
+- **`fast`**: up to **4 findings per batch**
+
+Build batches with a single left-to-right greedy pass over that sorted list: append the next finding to the current batch until adding another would exceed the cap, then start a new batch. Do **not** reorder findings beyond the initial sort to chase file grouping. Run the loop below **once per batch** in deterministic batch order. Within the loop, `contested` and `resolved` refer to the current batch only.
+
+In the pseudocode below, `all_findings` means the **current debate batch input**, not the full run-wide finding set.
 
 After initial tally, partition findings:
 
@@ -197,6 +238,7 @@ for finding in all_findings:
             resolved.append(finding)
         elif finding.dismiss_count == 4:
             finding.status = "dismissed"
+            finding.dismissal_source = "blind_dismiss"
             resolved.append(finding)
         else:
             contested.append(finding)
@@ -206,11 +248,12 @@ for finding in all_findings:
         if finding.confirm_count == 4:
             finding.status = "confirmed"
             resolved.append(finding)
-        elif finding.confirm_count == 3 and fully_covered and not finding.evidence_unverified and enough_coverage:
+        elif finding.confirm_count == 3 and finding.dismiss_count == 0 and not finding.evidence_unverified and enough_coverage:
             finding.status = "confirmed"
             resolved.append(finding)
         elif finding.dismiss_count == 4:
             finding.status = "dismissed"
+            finding.dismissal_source = "blind_dismiss"
             resolved.append(finding)
         elif finding.confirm_count == 1 and fully_covered:
             finding.status = "dismissed"
@@ -238,7 +281,7 @@ for finding in resolved + contested:
 ```
 `finding.raising_models` = the set of role names (e.g., `"Implementer"`, `"Challenger"`) whose §4 output included this finding. Findings in `resolved` with `confirm_count == 4` will have all 4 roles in `raising_models`; those with `confirm_count == 0` will have none.
 
-If `contested` is empty, skip to §7/§8 ledger writes.
+If `contested` is empty, skip the **main debate loop** and proceed directly to the optional §6.5 skeptic round / §6.7 live-data round gating, then to §7/§8 ledger writes.
 
 **Helper definitions:**
 
@@ -247,7 +290,7 @@ def vote_vector(finding_id, round_num, phase="main"):
     """Return an ordered tuple of vote values for a finding in a specific round and phase.
     Order: (Implementer, Implementer-Alt, Challenger, Orchestrator-Reviewer) — canonical model role order.
     Returns None for any role that did not vote in the specified round and phase.
-    phase: "main" for §5/§6 initial debate; "skeptic_redebate" for §6.5 re-debate; "livedata_redebate" for §6.7 re-debate.
+    phase: "main" for §5/§6 initial debate; "skeptic_redebate" for §6.5 re-debate; "live_data_redebate" for §6.7 re-debate.
     Separate skeptic uphold/challenge votes use phase="skeptic" and are recorded for audit,
     but they are not confirm/dismiss debate rounds and therefore are not queried via vote_vector().
     Keyed by `role` (not model ID) — every vote record MUST include a `role` field."""
@@ -278,9 +321,14 @@ def latest_votes_from_prior_phase(finding_id):
 **Execution-profile constants (set by the caller — not configurable in `config.json`):**
 
 ```
-MAX_ROUNDS      = 10    # hard cap per phase; force-resolves remaining findings
-CUMULATIVE_CAP  = 15    # total debate rounds across ALL phases (§5/§6 + §6.5 + §6.7) per finding
-AGENT_TIMEOUT   = 600   # seconds to wait per agent before treating as failed  # F-c2-001
+if EXECUTION_PROFILE == "exhaustive":
+    MAX_ROUNDS      = 10
+    CUMULATIVE_CAP  = 15
+    AGENT_TIMEOUT   = 600
+else:  # fast
+    MAX_ROUNDS      = 2
+    CUMULATIVE_CAP  = 2
+    AGENT_TIMEOUT   = 300
 ```
 
 **Round loop:**
@@ -305,10 +353,10 @@ round = 1
 # Phase context flag — initialized by the caller before entering this loop:
 #   is_redebate = False   # §5/§6 initial debate
 #   is_redebate = True    # §6.5 skeptic re-debate or §6.7 live-data re-debate
-# current_phase = "main" | "skeptic_redebate" | "livedata_redebate"
+# current_phase = "main" | "skeptic_redebate" | "live_data_redebate"
 # Separate uphold/challenge audit votes from §6.5 use phase="skeptic" and are not driven by this loop.
 # These variables are SET BY THE CALLER (§5/§6 sets is_redebate=False, current_phase="main";
-# §6.5 sets is_redebate=True, current_phase="skeptic_redebate"; §6.7 sets is_redebate=True, current_phase="livedata_redebate").
+# §6.5 sets is_redebate=True, current_phase="skeptic_redebate"; §6.7 sets is_redebate=True, current_phase="live_data_redebate").
 # They are NOT modified inside this loop.
 
 while contested is not empty AND round <= MAX_ROUNDS:
@@ -367,13 +415,13 @@ while contested is not empty AND round <= MAX_ROUNDS:
                 remove from contested  # only remove when stuck — non-stuck findings continue to next round
         if contested is empty: break
 
-    # F-c1-011: launch one agent per role (4 total), each receives ALL contested findings
-    # Every agent receives the frozen input snapshot:
-    #   all contested finding details + all votes and reasoning from prior rounds
+# F-c1-011: launch one agent per role (4 total), each receives the CURRENT debate batch
+# Every agent receives the frozen input snapshot:
+#   the current batch's finding details + all votes and reasoning from prior rounds
     # Use the debate round prompt template from the review-templates skill.
     # Launch the 4 debate agents concurrently via the task tool,
     # using whatever runtime-supported non-serial launch pattern keeps all 4
-    # active before collection, plus agent_type="code-review" and the
+    # active before collection, plus agent_type="general-purpose" and the
     # assigned model for each role.
     # CRITICAL: set model: explicitly on each task call
     # Capture snapshot of contested BEFORE launching — used for cumulative counter at end of round
@@ -396,6 +444,31 @@ while contested is not empty AND round <= MAX_ROUNDS:
                 replace failed_agent with retry_result in this_round_agents
             else:
                 log: "ERROR: Agent {model} failed retry in round {round}"
+
+    # --- Debate output count validation (before per-finding tally) ---
+    # Every successful debate agent must emit exactly one JSON vote line per
+    # contested finding plus `DEBATE_COMPLETE: N`. Validate declared vs parseable
+    # counts before collect_votes() so partial outputs cannot silently skew a vote
+    # vector or stuck-detection history.
+    for each successful_agent in this_round_agents:
+        parsed_vote_count = count_parseable_debate_vote_lines(successful_agent.output)
+        declared_count = extract_DEBATE_COMPLETE(successful_agent.output)  # exact trailer: `DEBATE_COMPLETE: N findings`
+        if declared_count is missing or malformed:
+            log: "WARN: Debate agent {model} omitted valid DEBATE_COMPLETE trailer in round {round} — using batch size {len(this_round_findings)} as declared_count."
+            declared_count = len(this_round_findings)
+        if parsed_vote_count < declared_count:
+            log: "WARN: Debate agent {model} declared {declared_count} votes but only {parsed_vote_count} were parseable in round {round} — sending recovery prompt."
+            recovery_result = send_recovery_prompt(successful_agent,
+                "Your previous debate output was truncated. You declared {declared_count} votes but only {parsed_vote_count} were parseable. "
+                "The last successfully parsed vote was for finding id `{last_parsed_id}`. Re-output votes for all findings after that one, "
+                "using the same JSON format and ending with DEBATE_COMPLETE.")
+            merge any successfully parsed recovery votes with the original round output
+            if parsed_vote_count still < declared_count after recovery:
+                log: "WARN: Debate agent {model} still missing {declared_count - parsed_vote_count} vote(s) after recovery in round {round}."
+    # Missing debate votes are never synthesized as confirm/dismiss. They remain
+    # absent from collect_votes(), which forces the finding down the explicit
+    # debate_unresolved path below rather than silently counting a partial vector
+    # as complete.
 
     for finding in contested:
         # round_votes: list of {model, vote, reasoning} dicts returned by this round's agents
@@ -502,9 +575,9 @@ For every finding, insert one row per model. Every vote record MUST include `rol
 ```python
 votes[finding_id].append({
     "role": role,          # canonical role name: "Implementer", "Implementer-Alt", "Challenger", "Orchestrator-Reviewer"
-    "model": model_id,     # actual model ID (e.g. "claude-opus-4.6") — for audit/reporting only
+    "model": model_id,     # actual model ID (e.g. "claude-opus-4.7") — for audit/reporting only
     "round": debate_round, # 0 = blind review tally, 1+ = debate rounds (reset to 1 at each phase start)
-    "phase": phase,        # "main" (§5/§6), "skeptic" (§6.5 uphold/challenge), "skeptic_redebate" (§6.5 re-debate), "livedata_redebate" (§6.7 re-debate)
+    "phase": phase,        # "main" (§5/§6), "skeptic" (§6.5 uphold/challenge), "skeptic_redebate" (§6.5 re-debate), "live_data_redebate" (§6.7 re-debate)
     "vote": vote,
     "reasoning": justification
 })  # F-c1-010
@@ -527,11 +600,14 @@ findings[id]["status"] = "confirmed"  # F-c1-010
 
 ## Report Template
 
-Write to `.adversarial-review/reports/YYYY-MM-DD-cycle-{N}-report.md`. Use today's date for the filename.
+When the run ends normally, write the **final aggregate report** to `.adversarial-review/reports/YYYY-MM-DD-cycle-{N}-report.md`. Use today's date for the filename. `cycle-{N}` identifies the **terminal cycle of the run**; it does **not** mean the document is limited to cycle-{N}-only data. When the run stops early because of user stop, blind-review viability failure, fix-agent failure, explicit cycle abort, or fatal ledger-write failure, write a **partial aggregate report** to `.adversarial-review/reports/YYYY-MM-DD-cycle-{N}-partial.md` instead.
 
 ```markdown
-# Adversarial Code Review — Cycle {N}
+# Adversarial Code Review — {REPORT_KIND} Report (ended at Cycle {N})
 **Date:** {YYYY-MM-DD} | **Mode:** {mode} | **Profile:** {execution_profile} | **Repo:** {root}
+
+> Report scope: final aggregate for this invocation. Unless a section explicitly says otherwise, counts and tables below reflect the final disposition of findings across **all cycles in this run**, not only cycle {N}.
+> For partial reports, add `**Stop Reason:** {reason}` and `**Last Completed Phase:** {phase}` immediately under the metadata line, and render every not-yet-reached phase section as `Not run: partial-report-before-phase`.
 
 {IF execution_profile == "fast":}
 > Fast profile is advisory only: findings in this report were **not** appended to durable dismissal or confirmation ledgers.
@@ -541,17 +617,29 @@ Write to `.adversarial-review/reports/YYYY-MM-DD-cycle-{N}-report.md`. Use today
 | Files reviewed | New findings | Confirmed | Dismissed | Suppressed | Collisions |
 |...|...|...|...|...|...|
 
+## Process Telemetry
+| Metric | Value |
+|...|...|
+
+> Minimum telemetry to include: reviewer retries, parse recoveries, receipt batches, catch-up batches, debate batches, total debate rounds, skeptic candidates/challenges, live-data claim count, live-data batches, fetch-cache hits/misses, phase/section outcome notes (`disabled-by-profile`, `disabled-by-prompt`, `zero_candidates`, `zero_confirmed_findings`, `zero_verifiable_claims`, `all_batches_failed`, `partial-report-before-phase`), and any degraded-path skips.
+
 ## Confirmed Findings
-[For each, sorted by severity desc:]
+[All findings still open/confirmed at run end, sorted by severity desc. In a clean `review-and-fix` run, this section is empty.]
 ### {ID}: {Title}
 **Severity:** {level} | **Category:** {cat} | **File:** `{file}` | **Symbol:** `{symbol}` | **Votes:** {N}/4
+**Basis:** {basis}  [Include only when non-null; e.g. `training-data-only` or `live-data-failed`]
 **Description:** ...
 **Suggested fix:** ...
 
+## Fixed Findings
+[Findings that were confirmed in an earlier cycle of this run and later marked `fixed = true` before the run ended.]
+| Original ID | Title | File | Fixed In Cycle | Fixed At | Match Key |
+
 ## Dismissed Findings
+[All findings whose final disposition in this run is dismissed, including evidence-unverified auto-dismissals and skeptic/live-data reversals.]
 | ID | Title | File | Reason | Dismissed By | Source |
 
-> `Source` column values: `debate`, `force_resolve`, `skeptic_reversal`, `livedata_reversal`, `evidence_unverified`; in fast profile, `fast_low_confidence` may also appear for report-only 1/4 findings.
+> `Source` column values: `blind_dismiss`, `debate`, `force_resolve`, `skeptic_reversal`, `live_data_reversal`, `evidence_unverified`; in fast profile, `fast_low_confidence` may also appear for report-only 1/4 findings.
 
 ## Force-Resolved Findings
 [Findings that hit MAX_ROUNDS or stuck detection — resolved by majority vote with `debate_forced=true`]
@@ -561,29 +649,41 @@ Write to `.adversarial-review/reports/YYYY-MM-DD-cycle-{N}-report.md`. Use today
 [Main-phase findings where agent failures or genuine 2-2 deadlocks prevented resolution — `status = pending` with `debate_unresolved=true`, not written to ledgers. Causes: (1) agent failure (<2 votes received and retry failed), (2) stuck-detection 2-2 tie (same vote vector 3 consecutive rounds), (3) MAX_ROUNDS 2-2 tie. Re-debate 2-2 ties from §6.5/§6.7 remain confirmed and are shown in the Skeptic / Live-Data sections instead.]
 | ID | Title | File | Partial Votes | Cause |
 
-## Suppressed Findings (Prior Sessions)
-[Findings suppressed by fingerprint match against dismissed or confirmed ledgers]
-| Fingerprint | Category | File | Suppression Source | Originally Decided |
+## Suppressed Findings
+[Findings suppressed either by prior-session ledgers or by same-run confirmed suppression during later review-only cycles.]
+| Suppression Key | Category | File | Suppression Scope | Suppression Source | Originally Decided |
+
+> `Suppression Scope` values: `prior_session_dismissed`, `prior_session_fixed_confirmed`, or `same_run_confirmed`.
 
 ## Skeptic Round Results
-[Only include if skeptic round was enabled and ran. Shows outcome of §6.5 for each confirmed finding.]
-| ID | Title | Uphold | Challenge | Outcome | Re-Debate Rounds |
+[Always render this section in the final report. If the skeptic phase produced per-finding outcomes, show the table below; otherwise replace the table with `Not run: <reason>` where reason is one of `disabled-by-profile`, `disabled-by-prompt`, `zero_candidates`, or `partial-report-before-phase`.]
+| ID | Title | Uphold | Challenge | Outcome | Re-Debate Rounds | Flags |
+
+> `Flags` should include `skeptic_skipped` and/or `debate_unresolved` when applicable.
 
 ## Live-Data Verification Results
-[Only include if live-data verification was enabled and ran. Shows outcome of §6.7 for each verified finding.]
-| ID | Title | Verdict | Source URL | Claims Checked | Action Taken |
+[Always render this section in the final report. If the live-data phase produced per-finding outcomes, show the table below; otherwise replace the table with `Not run: <reason>` where reason is one of `disabled-by-profile`, `disabled-by-prompt`, `zero_confirmed_findings`, `zero_verifiable_claims`, or `partial-report-before-phase`.]
+| ID | Title | Verdict | Claims Checked | Source Count | Action Taken | Flags |
+
+> `Verdict` values for this per-finding table should be drawn from the finding-level set: `verified`, `contradicted`, `unverifiable`, or `not-applicable`. When `Action Taken = skipped (agent failure)`, use `Verdict = unverifiable` plus `Flags += live_data_skipped`.
+> `Flags` should include `live_data_skipped`, `live_data_contradicted`, and/or `debate_unresolved` when applicable.
+> `Action Taken` should explicitly surface `confirmed (training-data-only)`, `confirmed (live-data-failed)`, and `skipped (agent failure)` when applicable.
+
+## Live Data Claim Results
+[Always render this section in the final report. If claim verdict rows were recorded, show the table below. Otherwise replace the table with `Not run: <reason>` where reason is one of `disabled-by-profile`, `disabled-by-prompt`, `zero_confirmed_findings`, `zero_verifiable_claims`, or `partial-report-before-phase`. One row per canonical claim verification result, including `unverifiable` outcomes. If every row is synthetic recovery output because live-data batches all failed, still render the table and record `all_batches_failed` in telemetry / degraded-path notes.]
+| Claim ID | Linked Findings | Tool | Source URL | Verdict |
 
 ## Semantically Merged Findings
 [Findings merged during semantic dedup — recorded for audit. Omit this section if no merges occurred.]
 | Absorbed ID | Absorbed Title | Merged Into | Jaccard Score | Merge Method |
 
-> `Merge Method`: `auto` (Jaccard ≥ 0.65) or `orchestrator` (0.35–0.64 escalated to orchestrator judgment).
+> `Merge Method`: `auto` only (Jaccard ≥ 0.65 after severity protection). Near-duplicates below that threshold are logged but kept separate.
 
 ## Evidence-Unverified Findings
 [Findings where evidence text could not be located in the cited file — may indicate hallucinated evidence. Omit if none.]
 | ID | Title | File | Outcome | Evidence Snippet (first 80 chars) |
 
-> Findings with `evidence_unverified: true` and consolidated raise_count < 3 (after fingerprint dedup) are auto-dismissed. Findings with raise_count ≥ 3 proceed to debate with the flag noted. All are listed here regardless of outcome for manual inspection.
+> Findings with `evidence_unverified: true` and consolidated raise_count < 3 (after identity dedup) are auto-dismissed. Findings with raise_count ≥ 3 proceed to debate with the flag noted. All are listed here regardless of outcome for manual inspection.
 
 ## Vote Detail
 | Finding | Implementer | Implementer-Alt | Challenger | Orchestrator-Reviewer | Decision |
