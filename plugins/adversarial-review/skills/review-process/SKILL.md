@@ -52,7 +52,28 @@ fp_v1 in dismissed_fps  # check if fingerprint is in the in-memory dismissed_fps
 - **Match found — different canonical_fields:** Hash collision. Do NOT suppress. Flag the finding with `collision = true` and include it in normal voting.
 - **No match:** Proceed to reconciliation.
 
-**Canonical format for `canonical_fields`:** A pipe-delimited string matching the `fp_v1` input order: `category|repo_path|scope|title|evidence` (all values normalized per the `fp_v1` rules above). This deterministic format ensures equality comparison is reliable across sessions and serialization boundaries. Both the §7 dismissal ledger write and the suppression check here must use this exact format.
+**Confirmed-finding suppression check (mode-dependent):**
+
+After the dismissed check above, also check against the mode-appropriate confirmed fingerprint set:
+
+- In **review-only** mode: check `fp_v1 in confirmed_all_fps`
+- In **review-and-fix** mode: check `fp_v1 in confirmed_fps`
+
+```python
+# Review-only mode:
+fp_v1 in confirmed_all_fps  # suppress all previously confirmed findings  # F-c7-005
+# Review-and-fix mode:
+fp_v1 in confirmed_fps  # suppress only fixed confirmed findings
+```
+
+Apply the same match/collision logic as the dismissed check:
+- **Match found — same canonical_fields:** Mark finding as `suppressed`. Do not include in voting.
+- **Match found — different canonical_fields:** Hash collision. Do NOT suppress. Flag `collision = true`.
+- **No match:** Proceed to reconciliation.
+
+This is the authoritative reconciliation-time suppression gate. The prompt-level hint (injecting fingerprints into reviewer prompts) is best-effort only — reviewers may ignore it. This check is the defense-in-depth backstop that prevents previously confirmed findings from re-entering voting.
+
+**Canonical format for `canonical_fields`:**A pipe-delimited string matching the `fp_v1` input order: `category|repo_path|scope|title|evidence` (all values normalized per the `fp_v1` rules above). This deterministic format ensures equality comparison is reliable across sessions and serialization boundaries. Both the §7 dismissal ledger write and the suppression check here must use this exact format.
 
 ---
 
@@ -63,7 +84,7 @@ After all 4 reviewer agents complete, for each reviewer:
 1. Count the number of JSON objects successfully parsed from the output (valid finding lines with required fields).
 2. Extract the `REVIEW_COMPLETE: N` count from the end of the output.
 3. If `parsed_count < declared_count`: log `"WARN: Reviewer {model} declared {declared_count} findings but only {parsed_count} were parseable ({declared_count - parsed_count} malformed/missing lines)."`
-4. If `parsed_count == 0` AND `declared_count > 0`: log `"ERROR: Reviewer {model} returned 0 parseable findings vs declared {declared_count} — output may be entirely malformed."` and attempt one retry of that reviewer agent. If retry also yields 0 parseable findings, proceed with 0 for that reviewer and flag in the §10 report.
+4. If `parsed_count == 0` AND `declared_count > 0`: log `"ERROR: Reviewer {model} returned 0 parseable findings vs declared {declared_count} — output may be entirely malformed."` and attempt one retry of that reviewer agent. If retry also yields 0 parseable findings, proceed with 0 for that reviewer and flag in the §10 report (per §13 rule 6a — do not stall waiting for user input).
 
 The reconciliation set is the **union of all non-suppressed findings** raised by any of the 4 reviewers.
 
@@ -98,6 +119,8 @@ A model's initial vote is:
 - **explicit confirm** — model raised the finding (was in its output)
 - **implicit dismiss** — model did not raise the finding during its independent review
 
+**Implicit-dismiss reasoning placeholder:** When recording round-0 votes for implicit-dismiss models (see Recording votes below), use the canonical reasoning text: `"(did not raise this finding in blind review)"`. This is a factual statement, not fabricated justification. Do NOT invent argumentative reasoning for why a model dismissed — it simply did not raise the finding.
+
 For each finding, tally initial votes:
 ```
 confirm_count = number of models that raised this finding
@@ -119,10 +142,23 @@ contested = findings where 0 < confirm_count < 4
 
 If `contested` is empty, skip to §7/§8 ledger writes.
 
+**Helper definitions:**
+
+```python
+def vote_vector(finding_id, round_num):
+    """Return an ordered tuple of vote values for a finding in a specific round.
+    Order: (Implementer, Implementer-Alt, Challenger, Orchestrator-Reviewer) — canonical model role order.
+    Returns None for any model that did not vote in the specified round."""
+    role_order = ["Implementer", "Implementer-Alt", "Challenger", "Orchestrator-Reviewer"]
+    round_votes = {v["model"]: v["vote"] for v in votes[finding_id] if v["round"] == round_num}
+    return tuple(round_votes.get(role, None) for role in role_order)
+```
+
 **Constants (configurable in `config.json` — see §14):**
 
 ```
-MAX_ROUNDS      = 10    # hard cap; force-resolves remaining findings
+MAX_ROUNDS      = 10    # hard cap per phase; force-resolves remaining findings
+CUMULATIVE_CAP  = 15    # total debate rounds across ALL phases (§5/§6 + §6.5 + §6.7) per finding
 AGENT_TIMEOUT   = 600   # seconds to wait per agent before treating as failed  # F-c2-001
 ```
 
@@ -131,7 +167,37 @@ AGENT_TIMEOUT   = 600   # seconds to wait per agent before treating as failed  #
 ```
 round = 1
 
+# Cumulative debate round tracker — persists across phases (§5/§6, §6.5, §6.7)
+# Initialize once per finding when it first enters any debate loop.
+# If cumulative_rounds does not yet exist for a finding, set it to 0.
+# cumulative_rounds: dict[str, int] — keyed by finding_id
+
+# Variable naming convention in this pseudocode:
+#   `finding` = the loop variable (a finding object from the contested list)
+#   `finding.id` or `id` = shorthand for the finding's stable ID (e.g., F-c1-001)
+#   `finding_id` = same as `id`, used when indexing the global votes ledger
+#   `findings[id]` = the global findings dict entry for this finding
+#   All three (`id`, `finding_id`, `finding.id`) refer to the same value within a loop iteration.
+
 while contested is not empty AND round <= MAX_ROUNDS:
+
+    # --- Cumulative cap check (before launching round) ---
+    for finding in contested:
+        if cumulative_rounds.get(finding.id, 0) >= CUMULATIVE_CAP:
+            log: "Finding {id} hit CUMULATIVE_CAP={CUMULATIVE_CAP} across all phases. Force-resolving."
+            latest_votes = vote_vector(finding.id, round - 1) if round > 1 else vote_vector(finding.id, 0)
+            confirm_count = count(v for v in latest_votes if v == 'confirm' and v is not None)
+            if confirm_count >= 3:
+                findings[id]["status"] = "confirmed"
+            elif confirm_count <= 1:
+                findings[id]["status"] = "dismissed"
+            else:
+                findings[id]["status"] = "pending"
+                findings[id]["debate_unresolved"] = True
+            findings[id]["debate_forced"] = True
+            remove from contested
+
+    if contested is empty: break
 
     # --- Stuck detection (check before launching) ---
     if round >= 4:
@@ -139,6 +205,9 @@ while contested is not empty AND round <= MAX_ROUNDS:
             current_vector  = vote_vector(finding, round - 1)
             previous_vector = vote_vector(finding, round - 2)
             two_rounds_ago  = vote_vector(finding, round - 3)
+            # Guard: skip stuck detection if any vector contains None (incomplete round)
+            if None in current_vector or None in previous_vector or None in two_rounds_ago:
+                continue  # Cannot detect stuck state with incomplete data
             if current_vector == previous_vector == two_rounds_ago:
                 log: "Finding {id} stalled — identical vote vector for 3 consecutive rounds. Force-resolving."
                 apply majority-vote rule (see Force-resolve below — 3/4+ → confirmed, 1/4 or 0/4 → dismissed, 2/4 → debate_unresolved)
@@ -216,6 +285,10 @@ while contested is not empty AND round <= MAX_ROUNDS:
                 votes[finding_id].append({"model": v["model"], "round": round, "vote": v["vote"], "reasoning": v["reasoning"], "debate_unresolved": True})
             remove from contested
 
+    # Increment cumulative round counter for all findings still in contested
+    for finding in contested:
+        cumulative_rounds[finding.id] = cumulative_rounds.get(finding.id, 0) + 1
+
     round += 1
 
 # --- Force-resolve: MAX_ROUNDS cap ---
@@ -248,9 +321,13 @@ if contested is not empty:
 
 **`debate_unresolved` findings:** Agent failures prevented a valid 4/4 tally. NOT written to §7/§8 ledgers. Appear in §10 with partial vote history and `debate_unresolved: true`. Kevin can manually review and reclassify.
 
-**`debate_forced` findings:** Hit MAX_ROUNDS or stuck-detection threshold. Written to the appropriate ledger (confirmed or dismissed) per majority-vote, with `debate_forced: true` in the findings JSONL (`cycle-{N}-findings.jsonl`). Surfaced as a dedicated subsection in §10.
+**`debate_forced` findings:** Hit MAX_ROUNDS or stuck-detection threshold. Written to the appropriate ledger (confirmed or dismissed) per majority-vote, with `debate_forced: true` in the confirmed/dismissed JSONL entries. Surfaced as a dedicated subsection in §10.
 
-After the loop, every finding has a terminal status: confirmed, dismissed, debate_unresolved, or debate_forced. Proceed to §7/§8 ledger writes (skipping debate_unresolved findings).
+After the loop, every finding has a terminal **status** of one of: `confirmed`, `dismissed`, `suppressed`, or `pending`. The flags `debate_forced` and `debate_unresolved` are **orthogonal metadata**, not statuses:
+- `debate_forced = True` + status `confirmed` or `dismissed`: finding was force-resolved by majority vote (MAX_ROUNDS or stuck detection). Written to the appropriate §7/§8 ledger with the flag preserved.
+- `debate_unresolved = True` + status `pending`: agent failures prevented a valid tally. NOT written to §7/§8 ledgers. Reported in §10 only.
+
+For termination/clean-cycle purposes: a finding is "resolved" when its status is `confirmed`, `dismissed`, or `suppressed`, OR when it has `debate_unresolved = True`. Proceed to §7/§8 ledger writes (skipping findings with `debate_unresolved = True`).
 
 ### Recording votes
 
@@ -294,7 +371,9 @@ Write to `.adversarial-review/reports/YYYY-MM-DD-cycle-{N}-report.md`. Use today
 **Suggested fix:** ...
 
 ## Dismissed Findings
-| ID | Title | File | Reason | Dismissed By |
+| ID | Title | File | Reason | Dismissed By | Source |
+
+> `Source` column values: `debate`, `force_resolve`, `skeptic_reversal`, `livedata_reversal` — matching §7 `dismissal_source`.
 
 ## Force-Resolved Findings
 [Findings that hit MAX_ROUNDS or stuck detection — resolved by majority vote with `debate_forced=true`]
@@ -305,7 +384,16 @@ Write to `.adversarial-review/reports/YYYY-MM-DD-cycle-{N}-report.md`. Use today
 | ID | Title | File | Partial Votes | Failure Reason |
 
 ## Suppressed Findings (Prior Sessions)
-| Fingerprint | Category | File | Originally Dismissed |
+[Findings suppressed by fingerprint match against dismissed or confirmed ledgers]
+| Fingerprint | Category | File | Suppression Source | Originally Decided |
+
+## Skeptic Round Results
+[Only include if skeptic round was enabled and ran. Shows outcome of §6.5 for each confirmed finding.]
+| ID | Title | Uphold | Challenge | Outcome | Re-Debate Rounds |
+
+## Live-Data Verification Results
+[Only include if live-data verification was enabled and ran. Shows outcome of §6.7 for each verified finding.]
+| ID | Title | Verdict | Source URL | Claims Checked | Action Taken |
 
 ## Vote Detail
 | Finding | Implementer | Implementer Alt | Challenger | Orchestrator | Decision |
