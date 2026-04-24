@@ -40,8 +40,10 @@ Truncate the hex digest to the first **24 characters** (96 bits of entropy — b
 ### Suppression check
 
 > **NOTE:** All vote and finding tracking is in-memory only — do NOT create SQL tables.  
-> State is rebuilt from JSONL files on each bootstrap. The pseudocode below uses  
-> Python-style dict/list notation to describe in-memory operations only. *(F-c1-010)*
+> Durable state is rebuilt from JSONL files on each bootstrap. Ephemeral in-run state  
+> (vote tracking, findings in progress, cycle history) is persisted to  
+> `.adversarial-review/session-state.json` per §2 Steps 0 and 4 of the agent spec — not in SQL.  
+> The pseudocode below uses Python-style dict/list notation to describe in-memory operations only. *(F-c1-010)*
 
 After computing `fp_v1` for a new finding, query `dismissed_findings`:
 ```python
